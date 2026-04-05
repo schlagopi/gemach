@@ -52,8 +52,8 @@ contract GemachPoolTest is Test {
         // deploy oracle: 1 BTC = 60,000 USDC
         oracle = new MockOracle();
 
-        // deploy auction
-        auction = new MockYearnAuction();
+        // deploy auction (want = USDC, receiver = pool set after pool deployment)
+        auction = new MockYearnAuction(address(usdc), address(0));
 
         // deploy router
         router = new AdapterRouter(address(authority), address(yvBTC), address(usdc));
@@ -88,7 +88,9 @@ contract GemachPoolTest is Test {
         pool.setFeeActivationBufferBps(1000); // 10%
         pool.setProtocolFeeBps(2000);         // 20%
         pool.setMinAuctionLot(0);
-        pool.setAuction(address(auction), keccak256("mock_auction"));
+        pool.setAuction(address(auction));
+        auction.setReceiver(address(pool));
+        auction.enable(address(cbBTC));
         pool.setFeeRecipient(feeRecipient);
 
         // fund alice with 10 BTC
@@ -827,13 +829,13 @@ contract GemachPoolTest is Test {
 
     function test_authority_onlyGovernanceCanGrant() public {
         vm.prank(nobody);
-        vm.expectRevert("not governance");
+        vm.expectRevert(); // OZ AccessControl custom error
         authority.grantRole(KEEPER_ROLE, nobody);
     }
 
     function test_authority_onlyGovernanceCanRevoke() public {
         vm.prank(nobody);
-        vm.expectRevert("not governance");
+        vm.expectRevert(); // OZ AccessControl custom error
         authority.revokeRole(KEEPER_ROLE, keeper);
     }
 
@@ -1029,9 +1031,8 @@ contract GemachPoolTest is Test {
     }
 
     function test_setAuction() public {
-        pool.setAuction(address(0x123), bytes32(uint256(1)));
+        pool.setAuction(address(0x123));
         assertEq(pool.yearnAuction(), address(0x123));
-        assertEq(pool.auctionId(), bytes32(uint256(1)));
     }
 
     function test_setFeeRecipient() public {
@@ -1120,18 +1121,23 @@ contract GemachPoolTest is Test {
     // --- keeper can also call keeper functions ---
 
     function test_auth_keeperCanCallKeeperFunctions() public {
-        pool.setAuction(address(auction), keccak256("mock_auction"));
-        auction.setKickable(keccak256("mock_auction"), 1);
+        // deposit collateral and create surplus
+        vm.prank(alice);
+        pool.deposit(1e8);
+        yvBTC.setSharePrice(110, 100);
 
         vm.prank(keeper);
-        pool.kickAuction();
+        pool.pushSurplusToAuction(1e8);
     }
 
     // --- governance can call keeper functions ---
 
     function test_auth_governanceCanCallKeeper() public {
-        auction.setKickable(keccak256("mock_auction"), 1);
-        pool.kickAuction(); // gov calling keeper function
+        vm.prank(alice);
+        pool.deposit(1e8);
+        yvBTC.setSharePrice(110, 100);
+
+        pool.pushSurplusToAuction(1e8); // gov calling keeper function
     }
 
     // --- guardian can call pause ---
@@ -1184,7 +1190,7 @@ contract GemachPoolTest is Test {
     // --- kick auction ---
 
     function test_kickAuction_revertsNoAuction() public {
-        pool.setAuction(address(0), bytes32(0));
+        pool.setAuction(address(0));
         vm.prank(keeper);
         vm.expectRevert("no auction");
         pool.kickAuction();
@@ -1665,4 +1671,303 @@ contract GemachPoolTest is Test {
         (uint256 principal,) = pool.positions(alice);
         assertEq(principal, 0);
     }
+
+    // ================================================================
+    //              AUCTION v1.0.4 PRICING TESTS
+    // ================================================================
+
+    function test_auction_pricingSetOnPush() public {
+        vm.prank(alice);
+        pool.deposit(1e8);
+        yvBTC.setSharePrice(110, 100);
+
+        vm.prank(keeper);
+        pool.pushSurplusToAuction(1e8);
+
+        // auction should have been kicked with pricing set
+        assertTrue(auction.isActive(address(cbBTC)));
+        // startingPrice should be nonzero
+        assertGt(auction.startingPrice(), 0, "startingPrice set");
+        // minimumPrice should be nonzero
+        assertGt(auction.minimumPrice(), 0, "minimumPrice set");
+        // stepDecayRate should match pool config
+        assertEq(auction.stepDecayRate(), pool.auctionDecayRate());
+    }
+
+    function test_auction_pricingMatchesOracle() public {
+        vm.prank(alice);
+        pool.deposit(1e8);
+        yvBTC.setSharePrice(110, 100);
+
+        vm.prank(keeper);
+        pool.pushSurplusToAuction(1e8);
+
+        // minimumPrice should reflect oracle * (10000 - slippage) / 10000
+        // oracle: 1e8 cbBTC = 60_000e6 USDC
+        // targetPrice = 60_000e6 * 1e18 / 1e6 = 6e22
+        // minimumPrice = 6e22 * (10000 - 50) / 10000 = 6e22 * 9950/10000
+        uint256 targetPrice = uint256(60_000e6) * 1e18 / 1e6;
+        uint256 expectedMin = targetPrice * (10000 - pool.auctionSlippageBps()) / 10000;
+        assertEq(auction.minimumPrice(), expectedMin, "minimumPrice matches oracle");
+    }
+
+    function test_auction_sellBackstopSetsPricing() public {
+        cbBTC.mint(keeper, 1e8);
+        vm.startPrank(keeper);
+        cbBTC.approve(address(pool), type(uint256).max);
+        pool.depositBackstop(1e8);
+        vm.stopPrank();
+
+        vm.prank(keeper);
+        pool.sellBackstopToAuction(1e8);
+
+        assertTrue(auction.isActive(address(cbBTC)));
+        assertGt(auction.startingPrice(), 0);
+    }
+
+    function test_auction_kickAuction_afterTokensInAuction() public {
+        // manually transfer tokens to auction and then kickAuction
+        vm.prank(alice);
+        pool.deposit(1e8);
+        yvBTC.setSharePrice(110, 100);
+
+        // first push creates an active auction
+        vm.prank(keeper);
+        pool.pushSurplusToAuction(1e8);
+
+        assertTrue(auction.isActive(address(cbBTC)));
+
+        // simulate full take (remove all cbBTC from auction)
+        uint256 auctionBal = cbBTC.balanceOf(address(auction));
+        vm.prank(address(auction));
+        cbBTC.transfer(address(0x999), auctionBal);
+
+        // settle the completed auction
+        auction.settle(address(cbBTC));
+        assertFalse(auction.isActive(address(cbBTC)));
+
+        // now put more tokens in auction manually and kick
+        cbBTC.mint(address(auction), 1e7);
+        vm.prank(keeper);
+        pool.kickAuction();
+
+        assertTrue(auction.isActive(address(cbBTC)));
+    }
+
+    function test_auction_revertsWhenActive() public {
+        vm.prank(alice);
+        pool.deposit(2e8);
+        yvBTC.setSharePrice(200, 100); // 100% yield = large surplus
+
+        vm.prank(keeper);
+        pool.pushSurplusToAuction(0.5e8);
+
+        // can't push again while auction is active
+        vm.prank(keeper);
+        vm.expectRevert("auction active");
+        pool.pushSurplusToAuction(0.5e8);
+    }
+
+    function test_auction_setAuctionPricingParams() public {
+        pool.setAuctionStartingPriceBps(10100);
+        assertEq(pool.auctionStartingPriceBps(), 10100);
+
+        pool.setAuctionSlippageBps(100);
+        assertEq(pool.auctionSlippageBps(), 100);
+
+        pool.setAuctionDecayRate(25);
+        assertEq(pool.auctionDecayRate(), 25);
+    }
+
+    function test_auction_setAuctionPricingParams_reverts() public {
+        vm.expectRevert("below oracle");
+        pool.setAuctionStartingPriceBps(9999);
+
+        vm.expectRevert("too high");
+        pool.setAuctionSlippageBps(5001);
+
+        vm.expectRevert("invalid");
+        pool.setAuctionDecayRate(0);
+
+        vm.expectRevert("invalid");
+        pool.setAuctionDecayRate(10000);
+    }
+
+    // ================================================================
+    //              POSITION VIEWER TESTS
+    // ================================================================
+
+    function test_viewer_getUserPosition() public {
+        PositionViewer viewer = new PositionViewer();
+
+        vm.prank(alice);
+        pool.deposit(1e8);
+        vm.prank(alice);
+        pool.borrow(30_000e6, alice);
+
+        PositionViewer.UserPositionData memory data = viewer.getUserPosition(address(pool), alice);
+
+        assertEq(data.principal, 1e8);
+        assertEq(data.currentDebt, 30_000e6);
+        assertEq(data.collateralValue, 60_000e6);
+        assertTrue(data.hasPosition);
+        assertFalse(data.isLiquidatable);
+        // LTV = 30000/60000 = 5000 bps
+        assertEq(data.currentLtvBps, 5000);
+        // available to borrow: maxLTV 75% of 60k = 45k, already 30k = 15k
+        assertEq(data.availableToBorrow, 15_000e6);
+        assertGt(data.availableToWithdraw, 0);
+    }
+
+    function test_viewer_isLiquidatable() public {
+        PositionViewer viewer = new PositionViewer();
+
+        vm.prank(alice);
+        pool.deposit(1e8);
+        vm.prank(alice);
+        pool.borrow(44_000e6, alice);
+
+        assertFalse(viewer.isLiquidatable(address(pool), alice));
+
+        oracle.setPrice(50_000e6);
+        // LTV = 44000/50000 = 88% > 85%
+        assertTrue(viewer.isLiquidatable(address(pool), alice));
+    }
+
+    function test_viewer_currentLtv() public {
+        PositionViewer viewer = new PositionViewer();
+
+        vm.prank(alice);
+        pool.deposit(1e8);
+
+        assertEq(viewer.currentLtv(address(pool), alice), 0);
+
+        vm.prank(alice);
+        pool.borrow(30_000e6, alice);
+
+        assertEq(viewer.currentLtv(address(pool), alice), 5000); // 50%
+    }
+
+    function test_viewer_totalDebt() public {
+        PositionViewer viewer = new PositionViewer();
+
+        vm.prank(alice);
+        pool.deposit(1e8);
+        vm.prank(alice);
+        pool.borrow(20_000e6, alice);
+
+        assertEq(viewer.totalDebt(address(pool), alice), 20_000e6);
+    }
+
+    function test_viewer_getGlobalState() public {
+        PositionViewer viewer = new PositionViewer();
+
+        vm.prank(alice);
+        pool.deposit(1e8);
+        vm.prank(alice);
+        pool.borrow(20_000e6, alice);
+
+        PositionViewer.GlobalStateData memory state = viewer.getGlobalState(address(pool));
+
+        assertEq(state.totalPrincipal, 1e8);
+        assertEq(state.totalUserDebt, 20_000e6);
+        assertEq(state.externalDebt, 20_000e6);
+        assertEq(state.carryGap, 0);
+        assertEq(state.debtIndex, 1e18);
+        assertFalse(state.emergencyMode);
+        assertFalse(state.paused);
+    }
+
+    function test_viewer_utilizationBps() public {
+        PositionViewer viewer = new PositionViewer();
+
+        vm.prank(alice);
+        pool.deposit(1e8);
+        vm.prank(alice);
+        pool.borrow(30_000e6, alice);
+
+        // utilization = 30000 / 60000 = 50% = 5000 bps
+        assertEq(viewer.utilizationBps(address(pool)), 5000);
+    }
+
+    function test_viewer_batchIsLiquidatable() public {
+        PositionViewer viewer = new PositionViewer();
+
+        vm.prank(alice);
+        pool.deposit(1e8);
+        vm.prank(alice);
+        pool.borrow(44_000e6, alice);
+
+        vm.prank(bob);
+        pool.deposit(1e8);
+        vm.prank(bob);
+        pool.borrow(20_000e6, bob);
+
+        oracle.setPrice(50_000e6);
+
+        address[] memory users = new address[](2);
+        users[0] = alice;
+        users[1] = bob;
+
+        bool[] memory results = viewer.batchIsLiquidatable(address(pool), users);
+        assertTrue(results[0]);  // alice: 44000/50000 = 88% > 85%
+        assertFalse(results[1]); // bob: 20000/50000 = 40% < 85%
+    }
+
+    function test_viewer_availableToBorrow_noPosition() public {
+        PositionViewer viewer = new PositionViewer();
+        assertEq(viewer.availableToBorrow(address(pool), nobody), 0);
+    }
+
+    function test_viewer_availableToWithdraw_noDebt() public {
+        PositionViewer viewer = new PositionViewer();
+
+        vm.prank(alice);
+        pool.deposit(1e8);
+
+        assertEq(viewer.availableToWithdraw(address(pool), alice), 1e8);
+    }
+
+    function test_viewer_collateralValue() public {
+        PositionViewer viewer = new PositionViewer();
+
+        vm.prank(alice);
+        pool.deposit(1e8);
+
+        assertEq(viewer.collateralValue(address(pool), alice), 60_000e6);
+    }
+
+    // ================================================================
+    //              AUTHORITY OZ AccessControlEnumerable TESTS
+    // ================================================================
+
+    function test_authority_ozRoles() public view {
+        // deployer has DEFAULT_ADMIN_ROLE
+        assertTrue(authority.hasRole(authority.DEFAULT_ADMIN_ROLE(), gov));
+        // deployer has GOVERNANCE_ROLE
+        assertTrue(authority.hasRole(GOVERNANCE_ROLE, gov));
+        // KEEPER_ROLE admin is GOVERNANCE_ROLE
+        assertEq(authority.getRoleAdmin(KEEPER_ROLE), GOVERNANCE_ROLE);
+        assertEq(authority.getRoleAdmin(GUARDIAN_ROLE), GOVERNANCE_ROLE);
+    }
+
+    function test_authority_governanceCanManageKeepers() public {
+        // governance can grant keeper
+        authority.grantRole(KEEPER_ROLE, nobody);
+        assertTrue(authority.hasRole(KEEPER_ROLE, nobody));
+        assertEq(authority.getRoleMemberCount(KEEPER_ROLE), 2);
+
+        // governance can revoke
+        authority.revokeRole(KEEPER_ROLE, nobody);
+        assertFalse(authority.hasRole(KEEPER_ROLE, nobody));
+    }
+
+    function test_authority_keeperCannotGrantKeeper() public {
+        // keepers can't manage other keepers (not admin of that role)
+        vm.prank(keeper);
+        vm.expectRevert();
+        authority.grantRole(KEEPER_ROLE, nobody);
+    }
 }
+
+import {PositionViewer} from "../src/core/PositionViewer.sol";
