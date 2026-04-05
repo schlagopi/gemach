@@ -7,8 +7,8 @@ import {MockERC20} from "./MockERC20.sol";
 /// @notice Mock for the Yearn V3 Auction v1.0.4. Tracks state for testing
 ///         the pool's auction integration including pricing configuration.
 contract MockYearnAuction {
-    address public want;      // debt token
-    address public receiver;  // where want goes on takes
+    address public want; // debt token
+    address public receiver; // where want goes on takes
 
     uint256 public startingPrice;
     uint256 public minimumPrice;
@@ -55,14 +55,22 @@ contract MockYearnAuction {
         return false; // simplified for mock
     }
 
-    function price(address) external pure returns (uint256) { return 1e18; }
-    function price(address, uint256) external pure returns (uint256) { return 1e18; }
+    function price(address) external pure returns (uint256) {
+        return 1e18;
+    }
+
+    function price(address, uint256) external pure returns (uint256) {
+        return 1e18;
+    }
+
     function getAmountNeeded(address _from) external view returns (uint256) {
         return available(_from); // 1:1 for simplicity
     }
+
     function getAmountNeeded(address, uint256 _amount) external pure returns (uint256) {
         return _amount;
     }
+
     function getAllEnabledAuctions() external pure returns (address[] memory) {
         return new address[](0);
     }
@@ -107,12 +115,29 @@ contract MockYearnAuction {
         enabled[_from] = false;
     }
 
-    function setStartingPrice(uint256 _sp) external { startingPrice = _sp; }
-    function setMinimumPrice(uint256 _mp) external { minimumPrice = _mp; }
-    function setStepDecayRate(uint256 _sdr) external { stepDecayRate = _sdr; }
-    function setStepDuration(uint256 _sd) external { stepDuration = _sd; }
-    function setReceiver(address _r) external { receiver = _r; }
-    function setGovernanceOnlyKick(bool _g) external { governanceOnlyKick = _g; }
+    function setStartingPrice(uint256 _sp) external {
+        startingPrice = _sp;
+    }
+
+    function setMinimumPrice(uint256 _mp) external {
+        minimumPrice = _mp;
+    }
+
+    function setStepDecayRate(uint256 _sdr) external {
+        stepDecayRate = _sdr;
+    }
+
+    function setStepDuration(uint256 _sd) external {
+        stepDuration = _sd;
+    }
+
+    function setReceiver(address _r) external {
+        receiver = _r;
+    }
+
+    function setGovernanceOnlyKick(bool _g) external {
+        governanceOnlyKick = _g;
+    }
 
     function initialize(address _want, address _receiver, address, uint256 _sp) external {
         want = _want;

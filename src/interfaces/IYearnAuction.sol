@@ -101,10 +101,5 @@ interface IYearnAuction {
     function setGovernanceOnlyKick(bool _governanceOnlyKick) external;
 
     /// @notice Initialize the auction (called by factory).
-    function initialize(
-        address _want,
-        address _receiver,
-        address _governance,
-        uint256 _startingPrice
-    ) external;
+    function initialize(address _want, address _receiver, address _governance, uint256 _startingPrice) external;
 }

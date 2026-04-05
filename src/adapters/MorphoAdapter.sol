@@ -50,19 +50,11 @@ interface IMorpho {
         bytes calldata data
     ) external returns (uint256 assetsRepaid, uint256 sharesRepaid);
 
-    function supplyCollateral(
-        MarketParams calldata marketParams,
-        uint256 assets,
-        address onBehalf,
-        bytes calldata data
-    ) external;
+    function supplyCollateral(MarketParams calldata marketParams, uint256 assets, address onBehalf, bytes calldata data)
+        external;
 
-    function withdrawCollateral(
-        MarketParams calldata marketParams,
-        uint256 assets,
-        address onBehalf,
-        address receiver
-    ) external;
+    function withdrawCollateral(MarketParams calldata marketParams, uint256 assets, address onBehalf, address receiver)
+        external;
 
     struct Position {
         uint256 supplyShares;

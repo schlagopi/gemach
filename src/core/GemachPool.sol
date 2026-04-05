@@ -21,15 +21,15 @@ contract GemachPool is Auth, ReentrancyGuard {
     // -------- position --------
 
     struct Position {
-        uint256 principal;   // exact collateral principal units owed back to user
-        uint256 debtShares;  // user-facing debt shares
+        uint256 principal; // exact collateral principal units owed back to user
+        uint256 debtShares; // user-facing debt shares
     }
 
     // -------- immutables --------
 
     address public immutable collateralToken; // e.g. cbBTC, WETH
-    address public immutable debtToken;       // e.g. USDC, aUSD
-    address public immutable yieldVault;      // ERC-4626 yield vault (e.g. yvBTC, yvETH)
+    address public immutable debtToken; // e.g. USDC, aUSD
+    address public immutable yieldVault; // ERC-4626 yield vault (e.g. yvBTC, yvETH)
 
     // -------- state --------
 
@@ -85,8 +85,8 @@ contract GemachPool is Auth, ReentrancyGuard {
 
         // auction pricing defaults (matching BaseConvertor)
         auctionStartingPriceBps = 10050; // 100.5% of oracle
-        auctionSlippageBps = 50;         // 0.5% below oracle floor
-        auctionDecayRate = 50;           // 0.5% decay per step
+        auctionSlippageBps = 50; // 0.5% below oracle floor
+        auctionDecayRate = 50; // 0.5% decay per step
 
         IERC20(_collateralToken).forceApprove(_yieldVault, type(uint256).max);
         IERC20(_yieldVault).forceApprove(_router, type(uint256).max);
@@ -131,7 +131,12 @@ contract GemachPool is Auth, ReentrancyGuard {
     }
 
     /// @notice Combined deposit + borrow convenience function.
-    function depositAndBorrow(uint256 depositAmount, uint256 borrowAmount, address receiver) external nonReentrant whenNotPaused whenNotEmergency {
+    function depositAndBorrow(uint256 depositAmount, uint256 borrowAmount, address receiver)
+        external
+        nonReentrant
+        whenNotPaused
+        whenNotEmergency
+    {
         require(depositAmount > 0, "zero deposit");
         IERC20(collateralToken).safeTransferFrom(msg.sender, address(this), depositAmount);
         uint256 vaultShares = IYearnVault4626(yieldVault).deposit(depositAmount, address(this));
@@ -181,12 +186,10 @@ contract GemachPool is Auth, ReentrancyGuard {
     // ================================================================
 
     /// @notice Liquidate an unhealthy position.
-    function liquidate(
-        address user,
-        uint256 repayAmount,
-        bool receiveCollateral,
-        address receiver
-    ) external nonReentrant {
+    function liquidate(address user, uint256 repayAmount, bool receiveCollateral, address receiver)
+        external
+        nonReentrant
+    {
         require(repayAmount > 0, "zero repay");
         require(_userLtvBps(user) > liquidationLtvBps, "not liquidatable");
 
@@ -236,9 +239,8 @@ contract GemachPool is Auth, ReentrancyGuard {
         // pull vault shares from router, redeem to collateral
         uint256 sharesNeeded = _ceilConvertToShares(amount);
         AdapterRouter(router).withdrawCollateralShares(sharesNeeded, address(this));
-        uint256 redeemed = IYearnVault4626(yieldVault).redeem(
-            IERC20(yieldVault).balanceOf(address(this)), address(this), address(this)
-        );
+        uint256 redeemed = IYearnVault4626(yieldVault)
+            .redeem(IERC20(yieldVault).balanceOf(address(this)), address(this), address(this));
 
         _configureAndKickAuction(redeemed);
     }
@@ -255,9 +257,8 @@ contract GemachPool is Auth, ReentrancyGuard {
 
         uint256 sharesNeeded = _ceilConvertToShares(amount);
         AdapterRouter(router).withdrawCollateralShares(sharesNeeded, address(this));
-        uint256 redeemed = IYearnVault4626(yieldVault).redeem(
-            IERC20(yieldVault).balanceOf(address(this)), address(this), address(this)
-        );
+        uint256 redeemed = IYearnVault4626(yieldVault)
+            .redeem(IERC20(yieldVault).balanceOf(address(this)), address(this), address(this));
 
         _configureAndKickAuction(redeemed);
     }
@@ -306,7 +307,13 @@ contract GemachPool is Auth, ReentrancyGuard {
     }
 
     /// @notice Withdraw sponsor backstop. Governance only, with safety checks.
-    function withdrawBackstop(uint256 amount, address receiver) external nonReentrant onlyGovernance whenNotPaused whenNotEmergency {
+    function withdrawBackstop(uint256 amount, address receiver)
+        external
+        nonReentrant
+        onlyGovernance
+        whenNotPaused
+        whenNotEmergency
+    {
         require(amount > 0, "zero amount");
         require(sponsorBackstop >= amount, "insufficient backstop");
         require(carryGap() == 0, "carry gap exists");
@@ -373,8 +380,13 @@ contract GemachPool is Auth, ReentrancyGuard {
     //                      PAUSE / ADMIN
     // ================================================================
 
-    function pause() external onlyGuardian { paused = true; }
-    function unpause() external onlyGovernance { paused = false; }
+    function pause() external onlyGuardian {
+        paused = true;
+    }
+
+    function unpause() external onlyGovernance {
+        paused = false;
+    }
 
     // --- governance setters ---
 
@@ -556,17 +568,13 @@ contract GemachPool is Auth, ReentrancyGuard {
     }
 
     function _collateralDecimals() internal view returns (uint8) {
-        (bool ok, bytes memory ret) = collateralToken.staticcall(
-            abi.encodeWithSignature("decimals()")
-        );
+        (bool ok, bytes memory ret) = collateralToken.staticcall(abi.encodeWithSignature("decimals()"));
         if (ok && ret.length >= 32) return abi.decode(ret, (uint8));
         return 18;
     }
 
     function _debtTokenDecimals() internal view returns (uint8) {
-        (bool ok, bytes memory ret) = debtToken.staticcall(
-            abi.encodeWithSignature("decimals()")
-        );
+        (bool ok, bytes memory ret) = debtToken.staticcall(abi.encodeWithSignature("decimals()"));
         if (ok && ret.length >= 32) return abi.decode(ret, (uint8));
         return 18;
     }
@@ -611,18 +619,12 @@ contract GemachPool is Auth, ReentrancyGuard {
         uint256 targetPrice = Math.mulDiv(oraclePrice, 1e18, 10 ** debtDecimals);
 
         // startingPrice (lot-size): above market
-        uint256 startUnitPrice = Math.mulDiv(
-            targetPrice, auctionStartingPriceBps, 10000, Math.Rounding.Ceil
-        );
-        uint256 startingPrice = Math.mulDiv(
-            _amount, startUnitPrice, fromUnit * 1e18, Math.Rounding.Ceil
-        );
+        uint256 startUnitPrice = Math.mulDiv(targetPrice, auctionStartingPriceBps, 10000, Math.Rounding.Ceil);
+        uint256 startingPrice = Math.mulDiv(_amount, startUnitPrice, fromUnit * 1e18, Math.Rounding.Ceil);
         if (startingPrice == 0) startingPrice = 1;
 
         // minimumPrice: floor below market
-        uint256 minimumPrice = Math.mulDiv(
-            targetPrice, 10000 - auctionSlippageBps, 10000
-        );
+        uint256 minimumPrice = Math.mulDiv(targetPrice, 10000 - auctionSlippageBps, 10000);
 
         // apply to auction
         if (auction_.startingPrice() != startingPrice) {

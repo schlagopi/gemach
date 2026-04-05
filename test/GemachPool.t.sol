@@ -60,12 +60,7 @@ contract GemachPoolTest is Test {
 
         // deploy pool
         pool = new GemachPool(
-            address(authority),
-            address(cbBTC),
-            address(usdc),
-            address(yvBTC),
-            address(router),
-            address(oracle)
+            address(authority), address(cbBTC), address(usdc), address(yvBTC), address(router), address(oracle)
         );
 
         // wire router to pool
@@ -82,11 +77,11 @@ contract GemachPoolTest is Test {
         router.addAdapter(address(adapterB));
 
         // configure pool parameters
-        pool.setMaxBorrowLtvBps(7500);        // 75%
-        pool.setLiquidationLtvBps(8500);      // 85%
-        pool.setLiquidationBonusBps(500);     // 5%
+        pool.setMaxBorrowLtvBps(7500); // 75%
+        pool.setLiquidationLtvBps(8500); // 85%
+        pool.setLiquidationBonusBps(500); // 5%
         pool.setFeeActivationBufferBps(1000); // 10%
-        pool.setProtocolFeeBps(2000);         // 20%
+        pool.setProtocolFeeBps(2000); // 20%
         pool.setMinAuctionLot(0);
         pool.setAuction(address(auction));
         auction.setReceiver(address(pool));
@@ -1910,7 +1905,7 @@ contract GemachPoolTest is Test {
         users[1] = bob;
 
         bool[] memory results = viewer.batchIsLiquidatable(address(pool), users);
-        assertTrue(results[0]);  // alice: 44000/50000 = 88% > 85%
+        assertTrue(results[0]); // alice: 44000/50000 = 88% > 85%
         assertFalse(results[1]); // bob: 20000/50000 = 40% < 85%
     }
 
