@@ -7,26 +7,29 @@ import {IMarketAdapter} from "../adapters/IMarketAdapter.sol";
 import {Auth} from "../utils/Auth.sol";
 
 /// @title AdapterRouter
-/// @notice Small router over approved lending adapters. Routes borrows to the
-///         lowest-cost adapter and repayments to the highest-cost adapter.
-///         Maintains a bounded set of enabled adapters (max 8).
+/// @notice Small router over approved lending adapters. Borrows from the
+///         preferred adapter first (governance-set order); repays in reverse
+///         order. No on-chain rate queries — management sets the priority.
 contract AdapterRouter is Auth {
     using SafeERC20 for IERC20;
 
     uint256 public constant MAX_ADAPTERS = 8;
 
-    address public immutable collateralToken; // yield vault share token
-    address public immutable debtToken;
+    address public immutable COLLATERAL_TOKEN; // yield vault share token
+    address public immutable DEBT_TOKEN;
 
-    address public pool; // only the pool may call mutative routing functions
+    address public pool;
 
+    /// @notice Ordered adapter list. Index 0 is the preferred borrow target;
+    ///         last index is the preferred repay target. Governance controls
+    ///         ordering via addAdapter / reorderAdapters.
     address[] public adapters;
     mapping(address => bool) public adapterEnabled;
 
     constructor(address _authority, address _collateralToken, address _debtToken) {
         authority = _authority;
-        collateralToken = _collateralToken;
-        debtToken = _debtToken;
+        COLLATERAL_TOKEN = _collateralToken;
+        DEBT_TOKEN = _debtToken;
     }
 
     modifier onlyPool() {
@@ -36,36 +39,30 @@ contract AdapterRouter is Auth {
 
     // -------- governance config --------
 
-    /// @notice Set the authorized pool. Governance only.
     function setPool(address _pool) external onlyGovernance {
         pool = _pool;
     }
 
-    /// @notice Add an adapter. Governance only.
     function addAdapter(address adapter) external onlyGovernance {
         require(!adapterEnabled[adapter], "already enabled");
         require(adapters.length < MAX_ADAPTERS, "max adapters");
-        require(IMarketAdapter(adapter).collateralToken() == collateralToken, "wrong collateral");
-        require(IMarketAdapter(adapter).loanToken() == debtToken, "wrong loan");
+        require(IMarketAdapter(adapter).collateralToken() == COLLATERAL_TOKEN, "wrong collateral");
+        require(IMarketAdapter(adapter).loanToken() == DEBT_TOKEN, "wrong loan");
         adapters.push(adapter);
         adapterEnabled[adapter] = true;
-
-        IERC20(collateralToken).forceApprove(adapter, type(uint256).max);
-        IERC20(debtToken).forceApprove(adapter, type(uint256).max);
+        IERC20(COLLATERAL_TOKEN).forceApprove(adapter, type(uint256).max);
+        IERC20(DEBT_TOKEN).forceApprove(adapter, type(uint256).max);
     }
 
-    /// @notice Disable an adapter (stops new borrows, still repayable). Governance only.
     function disableAdapter(address adapter) external onlyGovernance {
         require(adapterEnabled[adapter], "not enabled");
         adapterEnabled[adapter] = false;
     }
 
-    /// @notice Remove a fully-drained adapter from the list. Governance only.
     function removeAdapter(address adapter) external onlyGovernance {
         require(!adapterEnabled[adapter], "still enabled");
         require(IMarketAdapter(adapter).totalDebt() == 0, "has debt");
         require(IMarketAdapter(adapter).totalCollateralShares() == 0, "has collateral");
-
         uint256 len = adapters.length;
         for (uint256 i = 0; i < len; i++) {
             if (adapters[i] == adapter) {
@@ -76,103 +73,81 @@ contract AdapterRouter is Auth {
         }
     }
 
+    /// @notice Reorder adapters. Index 0 = preferred for borrows,
+    ///         last index = preferred for repays. All current adapters
+    ///         must appear exactly once.
+    function reorderAdapters(address[] calldata _newOrder) external onlyGovernance {
+        require(_newOrder.length == adapters.length, "length mismatch");
+        // verify same set
+        for (uint256 i = 0; i < _newOrder.length; i++) {
+            bool found;
+            for (uint256 j = 0; j < adapters.length; j++) {
+                if (_newOrder[i] == adapters[j]) found = true;
+                break;
+            }
+            require(found, "unknown adapter");
+        }
+        adapters = _newOrder;
+    }
+
     // -------- pool-callable routing --------
 
-    /// @notice Supply collateral to the given adapter.
     function supplyCollateral(address adapter, uint256 shares) external onlyPool {
         require(adapterEnabled[adapter], "adapter not enabled");
-        IERC20(collateralToken).safeTransferFrom(msg.sender, address(this), shares);
+        IERC20(COLLATERAL_TOKEN).safeTransferFrom(msg.sender, address(this), shares);
         IMarketAdapter(adapter).supplyCollateral(shares);
     }
 
-    /// @notice Supply collateral, auto-selecting the first enabled adapter.
     function supplyCollateralAuto(uint256 shares) external onlyPool {
         address adapter = _firstEnabled();
-        IERC20(collateralToken).safeTransferFrom(msg.sender, address(this), shares);
+        IERC20(COLLATERAL_TOKEN).safeTransferFrom(msg.sender, address(this), shares);
         IMarketAdapter(adapter).supplyCollateral(shares);
     }
 
-    /// @notice Borrow debt tokens, routing to the lowest-cost enabled adapter(s).
-    /// @return borrowed Total debt tokens actually borrowed.
+    /// @notice Borrow debt tokens. Tries adapters in order (index 0 first).
     function borrow(uint256 amount, address to) external onlyPool returns (uint256 borrowed) {
         uint256 remaining = amount;
         uint256 len = adapters.length;
-
-        while (remaining > 0) {
-            address best;
-            uint256 bestRate = type(uint256).max;
-
-            for (uint256 i = 0; i < len; i++) {
-                address a = adapters[i];
-                if (!adapterEnabled[a]) continue;
-                uint256 adapterLiq = IMarketAdapter(a).availableLiquidity();
-                if (adapterLiq == 0) continue;
-                uint256 rate = IMarketAdapter(a).currentBorrowRate();
-                if (rate < bestRate) {
-                    bestRate = rate;
-                    best = a;
-                }
-            }
-            require(best != address(0), "no liquidity");
-
-            uint256 liq = IMarketAdapter(best).availableLiquidity();
+        for (uint256 i = 0; i < len && remaining > 0; i++) {
+            address a = adapters[i];
+            if (!adapterEnabled[a]) continue;
+            uint256 liq = IMarketAdapter(a).availableLiquidity();
+            if (liq == 0) continue;
             uint256 chunk = remaining > liq ? liq : remaining;
-            uint256 got = IMarketAdapter(best).borrow(chunk, to);
+            uint256 got = IMarketAdapter(a).borrow(chunk, to);
             borrowed += got;
             remaining -= got;
         }
+        require(remaining == 0, "no liquidity");
     }
 
-    /// @notice Repay debt tokens, routing to the highest-cost adapter(s).
-    /// @return repaid Total debt tokens actually repaid.
+    /// @notice Repay debt tokens. Tries adapters in reverse order (last index first).
     function repay(uint256 amount) external onlyPool returns (uint256 repaid) {
-        IERC20(debtToken).safeTransferFrom(msg.sender, address(this), amount);
+        IERC20(DEBT_TOKEN).safeTransferFrom(msg.sender, address(this), amount);
         uint256 remaining = amount;
         uint256 len = adapters.length;
-
-        while (remaining > 0) {
-            address best;
-            uint256 bestRate = 0;
-            bool found;
-
-            for (uint256 i = 0; i < len; i++) {
-                address a = adapters[i];
-                uint256 adapterDebt = IMarketAdapter(a).totalDebt();
-                if (adapterDebt == 0) continue;
-                uint256 rate = IMarketAdapter(a).currentBorrowRate();
-                if (!found || rate > bestRate) {
-                    bestRate = rate;
-                    best = a;
-                    found = true;
-                }
-            }
-            if (!found) break;
-
-            uint256 debt = IMarketAdapter(best).totalDebt();
+        for (uint256 i = len; i > 0 && remaining > 0; i--) {
+            address a = adapters[i - 1];
+            uint256 debt = IMarketAdapter(a).totalDebt();
+            if (debt == 0) continue;
             uint256 chunk = remaining > debt ? debt : remaining;
-            uint256 paid = IMarketAdapter(best).repay(chunk);
+            uint256 paid = IMarketAdapter(a).repay(chunk);
             repaid += paid;
             remaining -= paid;
         }
-
-        // return any excess to the pool
         if (remaining > 0) {
-            IERC20(debtToken).safeTransfer(msg.sender, remaining);
+            IERC20(DEBT_TOKEN).safeTransfer(msg.sender, remaining);
         }
     }
 
-    /// @notice Repay a specific adapter directly. Pool only.
     function repayAdapter(address adapter, uint256 amount) external onlyPool returns (uint256) {
-        IERC20(debtToken).safeTransferFrom(msg.sender, address(this), amount);
+        IERC20(DEBT_TOKEN).safeTransferFrom(msg.sender, address(this), amount);
         return IMarketAdapter(adapter).repay(amount);
     }
 
-    /// @notice Withdraw collateral shares from adapters.
-    /// @return withdrawn Total collateral shares actually withdrawn.
     function withdrawCollateralShares(uint256 shares, address to) external onlyPool returns (uint256 withdrawn) {
         uint256 remaining = shares;
         uint256 len = adapters.length;
-
         for (uint256 i = 0; i < len && remaining > 0; i++) {
             address a = adapters[i];
             uint256 available = IMarketAdapter(a).withdrawableCollateralShares();
@@ -187,7 +162,6 @@ contract AdapterRouter is Auth {
 
     // -------- aggregate views --------
 
-    /// @notice Total debt across all adapters.
     function totalDebt() external view returns (uint256 total) {
         uint256 len = adapters.length;
         for (uint256 i = 0; i < len; i++) {
@@ -195,7 +169,6 @@ contract AdapterRouter is Auth {
         }
     }
 
-    /// @notice Total collateral shares across all adapters.
     function totalCollateralShares() external view returns (uint256 total) {
         uint256 len = adapters.length;
         for (uint256 i = 0; i < len; i++) {
@@ -203,12 +176,10 @@ contract AdapterRouter is Auth {
         }
     }
 
-    /// @notice Number of registered adapters.
     function adapterCount() external view returns (uint256) {
         return adapters.length;
     }
 
-    /// @notice Return the full adapter list.
     function getAdapters() external view returns (address[] memory) {
         return adapters;
     }

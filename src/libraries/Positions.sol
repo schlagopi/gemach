@@ -27,7 +27,7 @@ library Positions {
         uint256 totalUserDebt;
         uint256 externalDebt;
         uint256 carryGap;
-        uint256 bufferBalance;
+        uint256 protocolBuffer;
         uint256 harvestableSurplus;
         uint256 totalUnderlying;
         uint256 requiredBacking;
@@ -115,7 +115,7 @@ library Positions {
         data.totalUserDebt = p.totalUserDebt();
         data.externalDebt = p.externalDebt();
         data.carryGap = p.carryGap();
-        data.bufferBalance = p.bufferBalance();
+        data.protocolBuffer = p.protocolBuffer();
         data.harvestableSurplus = p.harvestableSurplus();
         data.totalUnderlying = p.totalUnderlying();
         data.requiredBacking = p.requiredBacking();
@@ -180,17 +180,11 @@ library Positions {
         if (currentColValue <= minColValue) return 0;
 
         uint256 excessValue = currentColValue - minColValue;
-        uint256 oneUnit = 10 ** _decimalsOf(p.collateralToken());
+        uint256 oneUnit = 10 ** p.COLLATERAL_DECIMALS();
         uint256 pricePerUnit = IPriceOracle(p.oracle()).quote(oneUnit);
         if (pricePerUnit == 0) return 0;
 
         uint256 withdrawable = excessValue * oneUnit / pricePerUnit;
         return withdrawable > principal ? principal : withdrawable;
-    }
-
-    function _decimalsOf(address token) private view returns (uint8) {
-        (bool ok, bytes memory ret) = token.staticcall(abi.encodeWithSignature("decimals()"));
-        if (ok && ret.length >= 32) return abi.decode(ret, (uint8));
-        return 18;
     }
 }

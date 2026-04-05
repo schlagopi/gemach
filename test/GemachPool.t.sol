@@ -167,23 +167,27 @@ contract GemachPoolTest is Test {
         yvBTC.setSharePrice(110, 100);
 
         uint256 debtBefore = pool.userDebt(alice);
-        uint256 bufferBefore = pool.bufferBalance();
+        uint256 bufferBefore = pool.protocolBuffer();
 
         vm.prank(keeper);
         pool.pushSurplusToAuction(1e8);
 
-        // simulate auction proceeds arriving
+        // simulate auction proceeds: USDC arrives at pool, then routed to repay adapters
         usdc.mint(address(pool), 5_000e6);
+        vm.prank(keeper);
+        pool.routeIdleDebtTokens(5_000e6);
 
+        // user debt unchanged, virtual buffer grew
         assertEq(pool.userDebt(alice), debtBefore);
-        assertGt(pool.bufferBalance(), bufferBefore);
+        assertGt(pool.protocolBuffer(), bufferBefore);
     }
 
     // ================================================================
-    //  SPEC TEST 4: Borrow uses lowest-cost adapter
+    //  SPEC TEST 4: Borrow uses preferred adapter (first in order)
     // ================================================================
 
-    function test_borrowUsesLowestCostAdapter() public {
+    function test_borrowUsesPreferredAdapter() public {
+        // adapters order: [A, B]. A is preferred for borrows.
         vm.prank(alice);
         pool.deposit(1e8);
         vm.prank(alice);
@@ -194,10 +198,10 @@ contract GemachPoolTest is Test {
     }
 
     // ================================================================
-    //  SPEC TEST 5: Repay routes to highest-cost adapter
+    //  SPEC TEST 5: Repay routes to last adapter (reverse order)
     // ================================================================
 
-    function test_repayRoutesToHighestCostAdapter() public {
+    function test_repayRoutesToLastAdapter() public {
         adapterA.setLiquidity(10_000e6);
 
         vm.prank(alice);
@@ -205,9 +209,11 @@ contract GemachPoolTest is Test {
         vm.prank(alice);
         pool.borrow(20_000e6, alice);
 
+        // A filled first (10k), then B (10k)
         assertEq(adapterA.totalDebt(), 10_000e6);
         assertEq(adapterB.totalDebt(), 10_000e6);
 
+        // Repay goes in reverse: B first (last in order)
         usdc.mint(alice, 5_000e6);
         vm.startPrank(alice);
         usdc.approve(address(pool), type(uint256).max);
@@ -608,17 +614,25 @@ contract GemachPoolTest is Test {
         vm.prank(alice);
         pool.borrow(20_000e6, alice);
 
-        // buffer > target (target = 20000 * 10% = 2000)
+        // Create virtual buffer by repaying adapter debt with external USDC
+        // userDebt = 20k, externalDebt starts at 20k
+        // Repay 10k -> externalDebt = 10k, buffer = 10k
         usdc.mint(address(pool), 10_000e6);
+        vm.prank(keeper);
+        pool.routeIdleDebtTokens(10_000e6);
 
         uint256 target = pool.totalUserDebt() * pool.feeActivationBufferBps() / 10000;
-        uint256 buffer = pool.bufferBalance();
+        uint256 buffer = pool.protocolBuffer();
+        assertGt(buffer, target, "buffer above target");
         uint256 excess = buffer - target;
         uint256 maxFee = excess * pool.protocolFeeBps() / 10000;
 
         uint256 recipientBefore = usdc.balanceOf(feeRecipient);
         pool.takeProtocolFee(maxFee);
+        // fee is extracted by borrowing from adapters
         assertEq(usdc.balanceOf(feeRecipient) - recipientBefore, maxFee);
+        // buffer shrank
+        assertLt(pool.protocolBuffer(), buffer);
     }
 
     // --- fee: reverts when no fee recipient ---
@@ -630,7 +644,10 @@ contract GemachPoolTest is Test {
         pool.deposit(1e8);
         vm.prank(alice);
         pool.borrow(20_000e6, alice);
-        usdc.mint(address(pool), 100_000e6);
+        // create buffer
+        usdc.mint(address(pool), 10_000e6);
+        vm.prank(keeper);
+        pool.routeIdleDebtTokens(10_000e6);
 
         vm.expectRevert("no fee recipient");
         pool.takeProtocolFee(1);
@@ -643,7 +660,7 @@ contract GemachPoolTest is Test {
         pool.deposit(1e8);
         vm.prank(alice);
         pool.borrow(20_000e6, alice);
-        // no buffer at all
+        // no virtual buffer (userDebt == externalDebt)
 
         vm.expectRevert("buffer below target");
         pool.takeProtocolFee(1);
@@ -656,9 +673,12 @@ contract GemachPoolTest is Test {
         pool.deposit(1e8);
         vm.prank(alice);
         pool.borrow(20_000e6, alice);
-        usdc.mint(address(pool), 100_000e6);
-
-        adapterA.accrueInterest(1_000e6);
+        // create buffer
+        usdc.mint(address(pool), 10_000e6);
+        vm.prank(keeper);
+        pool.routeIdleDebtTokens(10_000e6);
+        // then add carry gap
+        adapterA.accrueInterest(15_000e6);
 
         vm.expectRevert("carry gap exists");
         pool.takeProtocolFee(1);
@@ -671,10 +691,13 @@ contract GemachPoolTest is Test {
         pool.deposit(1e8);
         vm.prank(alice);
         pool.borrow(20_000e6, alice);
-        usdc.mint(address(pool), 100_000e6);
+        // create virtual buffer
+        usdc.mint(address(pool), 10_000e6);
+        vm.prank(keeper);
+        pool.routeIdleDebtTokens(10_000e6);
 
         uint256 target = pool.totalUserDebt() * pool.feeActivationBufferBps() / 10000;
-        uint256 buffer = pool.bufferBalance();
+        uint256 buffer = pool.protocolBuffer();
         uint256 excess = buffer - target;
         uint256 maxFee = excess * pool.protocolFeeBps() / 10000;
 
@@ -689,7 +712,6 @@ contract GemachPoolTest is Test {
         pool.deposit(1e8);
         vm.prank(alice);
         pool.borrow(20_000e6, alice);
-        usdc.mint(address(pool), 100_000e6);
 
         pool.forceEmergencyMode();
 
@@ -793,8 +815,14 @@ contract GemachPoolTest is Test {
         vm.prank(alice);
         pool.borrow(20_000e6, alice);
 
+        // create virtual buffer by repaying some adapter debt
+        usdc.mint(address(pool), 10_000e6);
+        vm.prank(keeper);
+        pool.routeIdleDebtTokens(10_000e6);
+
+        // add carry pressure but buffer still positive
         adapterA.accrueInterest(5_000e6);
-        usdc.mint(address(pool), 1e6); // tiny buffer
+        // userDebt=20k, externalDebt=10k+5k=15k, buffer=5k > 0
 
         vm.prank(keeper);
         pool.syncAndMaybeEnterEmergency();
@@ -1165,7 +1193,7 @@ contract GemachPoolTest is Test {
     }
 
     function test_manualDelever_revertsInsufficient() public {
-        vm.expectRevert("insufficient buffer");
+        vm.expectRevert("insufficient idle");
         pool.manualDelever(1);
     }
 
@@ -1286,7 +1314,7 @@ contract GemachPoolTest is Test {
 
     function test_depositAndBorrow_zeroDeposit() public {
         vm.prank(alice);
-        vm.expectRevert("zero deposit");
+        vm.expectRevert("zero amount");
         pool.depositAndBorrow(0, 1e6, alice);
     }
 
@@ -1294,7 +1322,7 @@ contract GemachPoolTest is Test {
 
     function test_depositAndBorrow_zeroBorrow() public {
         vm.prank(alice);
-        vm.expectRevert("zero borrow");
+        vm.expectRevert("zero amount");
         pool.depositAndBorrow(1e8, 0, alice);
     }
 
@@ -1612,7 +1640,7 @@ contract GemachPoolTest is Test {
 
         assertEq(adapterA.totalDebt(), 0);
         // excess should be returned to pool
-        assertGt(pool.bufferBalance(), 0);
+        assertGt(pool.protocolBuffer(), 0);
     }
 
     // --- oracle: zero price revert ---
@@ -1958,10 +1986,178 @@ contract GemachPoolTest is Test {
     }
 
     function test_authority_keeperCannotGrantKeeper() public {
-        // keepers can't manage other keepers (not admin of that role)
         vm.prank(keeper);
         vm.expectRevert();
         authority.grantRole(KEEPER_ROLE, nobody);
+    }
+
+    // ================================================================
+    //              OPERATOR TESTS
+    // ================================================================
+
+    function test_operator_borrowFrom() public {
+        vm.prank(alice);
+        pool.deposit(1e8);
+
+        // bob is not operator — should fail
+        vm.prank(bob);
+        vm.expectRevert("not authorized");
+        pool.borrowFrom(alice, 10_000e6, bob);
+
+        // alice approves bob as operator
+        vm.prank(alice);
+        pool.setOperator(bob, true);
+        assertTrue(pool.operators(alice, bob));
+
+        // now bob can borrow from alice's position
+        vm.prank(bob);
+        pool.borrowFrom(alice, 10_000e6, bob);
+        assertEq(pool.userDebt(alice), 10_000e6);
+        assertEq(usdc.balanceOf(bob), 10_000e6);
+    }
+
+    function test_operator_withdrawFrom() public {
+        vm.prank(alice);
+        pool.deposit(1e8);
+
+        vm.prank(alice);
+        pool.setOperator(bob, true);
+
+        uint256 bobBalBefore = cbBTC.balanceOf(bob);
+        vm.prank(bob);
+        pool.withdrawFrom(alice, 0.5e8, bob);
+        assertEq(cbBTC.balanceOf(bob) - bobBalBefore, 0.5e8);
+
+        (uint256 principal,) = pool.positions(alice);
+        assertEq(principal, 0.5e8);
+    }
+
+    function test_operator_revoke() public {
+        vm.prank(alice);
+        pool.setOperator(bob, true);
+        vm.prank(alice);
+        pool.setOperator(bob, false);
+
+        vm.prank(alice);
+        pool.deposit(1e8);
+
+        vm.prank(bob);
+        vm.expectRevert("not authorized");
+        pool.withdrawFrom(alice, 1e8, bob);
+    }
+
+    // ================================================================
+    //              DEPOSIT FOR TESTS
+    // ================================================================
+
+    function test_depositFor() public {
+        // bob deposits on behalf of alice
+        cbBTC.mint(bob, 1e8);
+        vm.startPrank(bob);
+        cbBTC.approve(address(pool), type(uint256).max);
+        pool.depositFor(alice, 1e8);
+        vm.stopPrank();
+
+        (uint256 principal,) = pool.positions(alice);
+        assertEq(principal, 1e8);
+        // bob's cbBTC was spent, alice got the principal
+        assertEq(cbBTC.balanceOf(bob), 5e8); // bob had 5 BTC from setUp + minted 1, spent 1
+    }
+
+    // ================================================================
+    //              ROUTER REORDER TEST
+    // ================================================================
+
+    function test_reorderAdapters() public {
+        // initial order: [A, B]
+        address[] memory order = router.getAdapters();
+        assertEq(order[0], address(adapterA));
+        assertEq(order[1], address(adapterB));
+
+        // reorder to [B, A]
+        address[] memory newOrder = new address[](2);
+        newOrder[0] = address(adapterB);
+        newOrder[1] = address(adapterA);
+        router.reorderAdapters(newOrder);
+
+        order = router.getAdapters();
+        assertEq(order[0], address(adapterB));
+        assertEq(order[1], address(adapterA));
+
+        // now borrows should go to B first
+        vm.prank(alice);
+        pool.deposit(1e8);
+        vm.prank(alice);
+        pool.borrow(10_000e6, alice);
+        assertEq(adapterB.totalDebt(), 10_000e6);
+        assertEq(adapterA.totalDebt(), 0);
+    }
+
+    function test_reorderAdapters_lengthMismatch() public {
+        address[] memory bad = new address[](1);
+        bad[0] = address(adapterA);
+        vm.expectRevert("length mismatch");
+        router.reorderAdapters(bad);
+    }
+
+    function test_reorderAdapters_unknownAdapter() public {
+        address[] memory bad = new address[](2);
+        bad[0] = address(adapterA);
+        bad[1] = address(0x999);
+        vm.expectRevert("unknown adapter");
+        router.reorderAdapters(bad);
+    }
+
+    // ================================================================
+    //              VIRTUAL BUFFER MODEL TEST
+    // ================================================================
+
+    function test_virtualBuffer() public {
+        vm.prank(alice);
+        pool.deposit(1e8);
+        vm.prank(alice);
+        pool.borrow(20_000e6, alice);
+
+        // initially buffer = 0 (userDebt == externalDebt)
+        assertEq(pool.protocolBuffer(), 0);
+
+        // repay some adapter debt -> creates virtual buffer
+        usdc.mint(address(pool), 5_000e6);
+        vm.prank(keeper);
+        pool.routeIdleDebtTokens(5_000e6);
+
+        // userDebt still 20k, externalDebt now 15k, buffer = 5k
+        assertEq(pool.totalUserDebt(), 20_000e6);
+        assertEq(pool.externalDebt(), 15_000e6);
+        assertEq(pool.protocolBuffer(), 5_000e6);
+    }
+
+    function test_feeExtraction_borrowsFromAdapters() public {
+        vm.prank(alice);
+        pool.deposit(1e8);
+        vm.prank(alice);
+        pool.borrow(20_000e6, alice);
+
+        // create buffer
+        usdc.mint(address(pool), 10_000e6);
+        vm.prank(keeper);
+        pool.routeIdleDebtTokens(10_000e6);
+
+        uint256 extDebtBefore = pool.externalDebt();
+        uint256 bufferBefore = pool.protocolBuffer();
+
+        // take fee
+        uint256 target = pool.totalUserDebt() * pool.feeActivationBufferBps() / 10000;
+        uint256 excess = bufferBefore - target;
+        uint256 fee = excess * pool.protocolFeeBps() / 10000;
+        pool.takeProtocolFee(fee);
+
+        // external debt increased (fee was borrowed)
+        assertGt(pool.externalDebt(), extDebtBefore);
+        // buffer decreased
+        assertLt(pool.protocolBuffer(), bufferBefore);
+        // fee recipient got USDC
+        assertEq(usdc.balanceOf(feeRecipient), fee);
     }
 }
 

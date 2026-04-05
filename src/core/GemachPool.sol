@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
@@ -15,6 +16,8 @@ import {Auth} from "../utils/Auth.sol";
 /// @notice Generic fixed-debt, reserve-backed, yield-subsidized borrowing pool.
 ///         Users deposit collateral, borrow debt tokens, and their debt stays
 ///         flat in normal mode. All yield is socialized to the protocol reserve.
+///         The buffer is virtual: totalUserDebt - externalDebt. All debt-token
+///         proceeds are used to repay adapters; fee extraction borrows from them.
 contract GemachPool is Auth, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -27,13 +30,16 @@ contract GemachPool is Auth, ReentrancyGuard {
 
     // -------- immutables --------
 
-    address public immutable collateralToken; // e.g. cbBTC, WETH
-    address public immutable debtToken; // e.g. USDC, aUSD
-    address public immutable yieldVault; // ERC-4626 yield vault (e.g. yvBTC, yvETH)
+    address public immutable COLLATERAL_TOKEN;
+    address public immutable DEBT_TOKEN;
+    address public immutable YIELD_VAULT;
+    uint8 public immutable COLLATERAL_DECIMALS;
+    uint8 public immutable DEBT_DECIMALS;
 
     // -------- state --------
 
     mapping(address => Position) public positions;
+    mapping(address => mapping(address => bool)) public operators;
 
     uint256 public totalPrincipal;
     uint256 public sponsorBackstop;
@@ -58,11 +64,8 @@ contract GemachPool is Auth, ReentrancyGuard {
     uint256 public protocolFeeBps;
     uint256 public minAuctionLot;
 
-    /// @notice Auction starting price as bps of oracle price (e.g. 10050 = 100.5%).
     uint256 public auctionStartingPriceBps;
-    /// @notice Maximum slippage below oracle for auction floor price in bps (e.g. 50 = 0.5%).
     uint256 public auctionSlippageBps;
-    /// @notice Auction step decay rate in bps per step (e.g. 50 = 0.5%).
     uint256 public auctionDecayRate;
 
     // -------- constructor --------
@@ -76,17 +79,18 @@ contract GemachPool is Auth, ReentrancyGuard {
         address _oracle
     ) {
         authority = _authority;
-        collateralToken = _collateralToken;
-        debtToken = _debtToken;
-        yieldVault = _yieldVault;
+        COLLATERAL_TOKEN = _collateralToken;
+        DEBT_TOKEN = _debtToken;
+        YIELD_VAULT = _yieldVault;
+        COLLATERAL_DECIMALS = IERC20Metadata(_collateralToken).decimals();
+        DEBT_DECIMALS = IERC20Metadata(_debtToken).decimals();
         router = _router;
         oracle = _oracle;
         debtIndex = 1e18;
 
-        // auction pricing defaults (matching BaseConvertor)
-        auctionStartingPriceBps = 10050; // 100.5% of oracle
-        auctionSlippageBps = 50; // 0.5% below oracle floor
-        auctionDecayRate = 50; // 0.5% decay per step
+        auctionStartingPriceBps = 10050;
+        auctionSlippageBps = 50;
+        auctionDecayRate = 50;
 
         IERC20(_collateralToken).forceApprove(_yieldVault, type(uint256).max);
         IERC20(_yieldVault).forceApprove(_router, type(uint256).max);
@@ -106,79 +110,78 @@ contract GemachPool is Auth, ReentrancyGuard {
     }
 
     // ================================================================
+    //                         OPERATORS
+    // ================================================================
+
+    /// @notice Approve or revoke an operator who can borrow/withdraw on your behalf.
+    function setOperator(address operator, bool approved) external {
+        operators[msg.sender][operator] = approved;
+    }
+
+    function _checkAuthorized(address user) internal view {
+        require(msg.sender == user || operators[user][msg.sender], "not authorized");
+    }
+
+    // ================================================================
     //                        USER FLOWS
     // ================================================================
 
-    /// @notice Deposit collateral.
+    /// @notice Deposit collateral for yourself.
     function deposit(uint256 amount) external nonReentrant whenNotPaused {
-        require(amount > 0, "zero amount");
-        IERC20(collateralToken).safeTransferFrom(msg.sender, address(this), amount);
-        uint256 vaultShares = IYearnVault4626(yieldVault).deposit(amount, address(this));
-        AdapterRouter(router).supplyCollateralAuto(vaultShares);
-        positions[msg.sender].principal += amount;
-        totalPrincipal += amount;
+        _deposit(msg.sender, amount);
     }
 
-    /// @notice Borrow debt tokens against deposited collateral.
+    /// @notice Deposit collateral on behalf of another user.
+    function depositFor(address onBehalfOf, uint256 amount) external nonReentrant whenNotPaused {
+        _deposit(onBehalfOf, amount);
+    }
+
+    /// @notice Borrow debt tokens against your collateral.
     function borrow(uint256 amount, address receiver) external nonReentrant whenNotPaused whenNotEmergency {
-        require(amount > 0, "zero amount");
-        uint256 shares = amount * 1e18 / debtIndex;
-        require(shares > 0, "shares zero");
-        positions[msg.sender].debtShares += shares;
-        totalDebtShares += shares;
-        require(_userLtvBps(msg.sender) <= maxBorrowLtvBps, "ltv exceeded");
-        AdapterRouter(router).borrow(amount, receiver);
+        _borrow(msg.sender, amount, receiver);
     }
 
-    /// @notice Combined deposit + borrow convenience function.
+    /// @notice Borrow from another user's position (requires operator approval).
+    function borrowFrom(address user, uint256 amount, address receiver)
+        external
+        nonReentrant
+        whenNotPaused
+        whenNotEmergency
+    {
+        _checkAuthorized(user);
+        _borrow(user, amount, receiver);
+    }
+
+    /// @notice Combined deposit + borrow for yourself.
     function depositAndBorrow(uint256 depositAmount, uint256 borrowAmount, address receiver)
         external
         nonReentrant
         whenNotPaused
         whenNotEmergency
     {
-        require(depositAmount > 0, "zero deposit");
-        IERC20(collateralToken).safeTransferFrom(msg.sender, address(this), depositAmount);
-        uint256 vaultShares = IYearnVault4626(yieldVault).deposit(depositAmount, address(this));
-        AdapterRouter(router).supplyCollateralAuto(vaultShares);
-        positions[msg.sender].principal += depositAmount;
-        totalPrincipal += depositAmount;
-
-        require(borrowAmount > 0, "zero borrow");
-        uint256 shares = borrowAmount * 1e18 / debtIndex;
-        require(shares > 0, "shares zero");
-        positions[msg.sender].debtShares += shares;
-        totalDebtShares += shares;
-        require(_userLtvBps(msg.sender) <= maxBorrowLtvBps, "ltv exceeded");
-        AdapterRouter(router).borrow(borrowAmount, receiver);
+        _deposit(msg.sender, depositAmount);
+        _borrow(msg.sender, borrowAmount, receiver);
     }
 
-    /// @notice Repay debt.
+    /// @notice Repay your own debt.
     function repay(uint256 amount) external nonReentrant {
         _repayFor(msg.sender, amount);
     }
 
-    /// @notice Repay debt on behalf of another user.
+    /// @notice Repay debt on behalf of another user (always permitted).
     function repayFor(address user, uint256 amount) external nonReentrant {
         _repayFor(user, amount);
     }
 
-    /// @notice Withdraw collateral.
+    /// @notice Withdraw your own collateral.
     function withdraw(uint256 amount, address receiver) external nonReentrant whenNotPaused {
-        require(amount > 0, "zero amount");
-        Position storage pos = positions[msg.sender];
-        require(pos.principal >= amount, "insufficient principal");
+        _withdraw(msg.sender, amount, receiver);
+    }
 
-        pos.principal -= amount;
-        totalPrincipal -= amount;
-
-        if (pos.debtShares > 0) {
-            require(_userLtvBps(msg.sender) <= maxBorrowLtvBps, "ltv exceeded");
-        }
-
-        uint256 sharesNeeded = _ceilConvertToShares(amount);
-        AdapterRouter(router).withdrawCollateralShares(sharesNeeded, address(this));
-        IYearnVault4626(yieldVault).withdraw(amount, receiver, address(this));
+    /// @notice Withdraw from another user's position (requires operator approval).
+    function withdrawFrom(address user, uint256 amount, address receiver) external nonReentrant whenNotPaused {
+        _checkAuthorized(user);
+        _withdraw(user, amount, receiver);
     }
 
     // ================================================================
@@ -197,7 +200,7 @@ contract GemachPool is Auth, ReentrancyGuard {
         uint256 currentDebt = pos.debtShares * debtIndex / 1e18;
         if (repayAmount > currentDebt) repayAmount = currentDebt;
 
-        IERC20(debtToken).safeTransferFrom(msg.sender, address(this), repayAmount);
+        IERC20(DEBT_TOKEN).safeTransferFrom(msg.sender, address(this), repayAmount);
         AdapterRouter(router).repay(repayAmount);
 
         uint256 sharesBurned = repayAmount * 1e18 / debtIndex;
@@ -215,9 +218,9 @@ contract GemachPool is Auth, ReentrancyGuard {
         AdapterRouter(router).withdrawCollateralShares(sharesNeeded, address(this));
 
         if (receiveCollateral) {
-            IYearnVault4626(yieldVault).withdraw(seizedCollateral, receiver, address(this));
+            IYearnVault4626(YIELD_VAULT).withdraw(seizedCollateral, receiver, address(this));
         } else {
-            IERC20(yieldVault).safeTransfer(receiver, sharesNeeded);
+            IERC20(YIELD_VAULT).safeTransfer(receiver, sharesNeeded);
         }
     }
 
@@ -226,8 +229,6 @@ contract GemachPool is Auth, ReentrancyGuard {
     // ================================================================
 
     /// @notice Push harvestable surplus to the Yearn auction and kick it.
-    ///         Sets auction pricing based on oracle (BaseConvertor pattern).
-    /// @param maxAmount Maximum collateral to push.
     function pushSurplusToAuction(uint256 maxAmount) external nonReentrant onlyKeeper {
         require(yearnAuction != address(0), "no auction");
         uint256 surplus = harvestableSurplus();
@@ -236,17 +237,15 @@ contract GemachPool is Auth, ReentrancyGuard {
         uint256 amount = maxAmount > surplus ? surplus : maxAmount;
         require(amount >= minAuctionLot, "below min lot");
 
-        // pull vault shares from router, redeem to collateral
         uint256 sharesNeeded = _ceilConvertToShares(amount);
         AdapterRouter(router).withdrawCollateralShares(sharesNeeded, address(this));
-        uint256 redeemed = IYearnVault4626(yieldVault)
-            .redeem(IERC20(yieldVault).balanceOf(address(this)), address(this), address(this));
+        uint256 redeemed = IYearnVault4626(YIELD_VAULT)
+            .redeem(IERC20(YIELD_VAULT).balanceOf(address(this)), address(this), address(this));
 
         _configureAndKickAuction(redeemed);
     }
 
     /// @notice Sell protocol sponsor backstop via Yearn auction.
-    /// @param maxAmount Maximum collateral to sell from backstop.
     function sellBackstopToAuction(uint256 maxAmount) external nonReentrant onlyKeeper {
         require(yearnAuction != address(0), "no auction");
         require(sponsorBackstop > 0, "no backstop");
@@ -257,27 +256,27 @@ contract GemachPool is Auth, ReentrancyGuard {
 
         uint256 sharesNeeded = _ceilConvertToShares(amount);
         AdapterRouter(router).withdrawCollateralShares(sharesNeeded, address(this));
-        uint256 redeemed = IYearnVault4626(yieldVault)
-            .redeem(IERC20(yieldVault).balanceOf(address(this)), address(this), address(this));
+        uint256 redeemed = IYearnVault4626(YIELD_VAULT)
+            .redeem(IERC20(YIELD_VAULT).balanceOf(address(this)), address(this), address(this));
 
         _configureAndKickAuction(redeemed);
     }
 
-    /// @notice Kick an auction for collateral already sitting in the auction contract.
-    ///         Useful if tokens were transferred but the auction wasn't kicked yet.
+    /// @notice Kick an auction for collateral already in the auction contract.
     function kickAuction() external onlyKeeper {
         require(yearnAuction != address(0), "no auction");
         IYearnAuction auction_ = IYearnAuction(yearnAuction);
-        require(!auction_.isActive(collateralToken), "auction active");
-        uint256 kickableAmt = auction_.kickable(collateralToken);
+        require(!auction_.isActive(COLLATERAL_TOKEN), "auction active");
+        uint256 kickableAmt = auction_.kickable(COLLATERAL_TOKEN);
         require(kickableAmt > 0, "nothing to kick");
         _setAuctionPricing(kickableAmt);
-        auction_.kick(collateralToken);
+        auction_.kick(COLLATERAL_TOKEN);
     }
 
-    /// @notice Route idle debt tokens in the pool to repay highest-cost adapter(s).
+    /// @notice Route idle debt tokens sitting in the pool to repay adapters.
+    ///         This grows the virtual protocol buffer.
     function routeIdleDebtTokens(uint256 maxAmount) external nonReentrant onlyKeeper {
-        uint256 idle = IERC20(debtToken).balanceOf(address(this));
+        uint256 idle = IERC20(DEBT_TOKEN).balanceOf(address(this));
         require(idle > 0, "no idle debt tokens");
         uint256 amount = maxAmount > idle ? idle : maxAmount;
         AdapterRouter(router).repay(amount);
@@ -287,21 +286,26 @@ contract GemachPool is Auth, ReentrancyGuard {
     //                   BUFFER / FEES / BACKSTOP
     // ================================================================
 
-    /// @notice Current idle debt-token buffer balance.
-    function bufferBalance() public view returns (uint256) {
-        return IERC20(debtToken).balanceOf(address(this));
+    /// @notice Virtual protocol buffer: the gap between what users owe and
+    ///         what is actually owed to external adapters. All surplus debt-token
+    ///         proceeds are used to repay adapters; the resulting gap IS the buffer.
+    function protocolBuffer() public view returns (uint256) {
+        uint256 uDebt = totalUserDebt();
+        uint256 extDebt = externalDebt();
+        return uDebt > extDebt ? uDebt - extDebt : 0;
     }
 
-    /// @notice Deposit debt tokens directly into the buffer.
+    /// @notice Deposit debt tokens into the buffer (repays adapters).
     function depositBuffer(uint256 amount) external nonReentrant onlyKeeper {
-        IERC20(debtToken).safeTransferFrom(msg.sender, address(this), amount);
+        IERC20(DEBT_TOKEN).safeTransferFrom(msg.sender, address(this), amount);
+        AdapterRouter(router).repay(amount);
     }
 
     /// @notice Deposit sponsor backstop in collateral token.
     function depositBackstop(uint256 amount) external nonReentrant onlyKeeper {
         require(amount > 0, "zero amount");
-        IERC20(collateralToken).safeTransferFrom(msg.sender, address(this), amount);
-        uint256 vaultShares = IYearnVault4626(yieldVault).deposit(amount, address(this));
+        IERC20(COLLATERAL_TOKEN).safeTransferFrom(msg.sender, address(this), amount);
+        uint256 vaultShares = IYearnVault4626(YIELD_VAULT).deposit(amount, address(this));
         AdapterRouter(router).supplyCollateralAuto(vaultShares);
         sponsorBackstop += amount;
     }
@@ -320,20 +324,24 @@ contract GemachPool is Auth, ReentrancyGuard {
         sponsorBackstop -= amount;
         uint256 sharesNeeded = _ceilConvertToShares(amount);
         AdapterRouter(router).withdrawCollateralShares(sharesNeeded, address(this));
-        IYearnVault4626(yieldVault).withdraw(amount, receiver, address(this));
+        IYearnVault4626(YIELD_VAULT).withdraw(amount, receiver, address(this));
     }
 
-    /// @notice Take protocol fee from buffer excess. Governance only.
+    /// @notice Take protocol fee from virtual buffer excess. Borrows from
+    ///         adapters to extract the fee, shrinking the virtual buffer.
     function takeProtocolFee(uint256 amount) external nonReentrant onlyGovernance whenNotPaused whenNotEmergency {
         require(feeRecipient != address(0), "no fee recipient");
         require(carryGap() == 0, "carry gap exists");
+
         uint256 target = totalUserDebt() * feeActivationBufferBps / 10000;
-        uint256 buffer = bufferBalance();
+        uint256 buffer = protocolBuffer();
         require(buffer > target, "buffer below target");
         uint256 excess = buffer - target;
         uint256 maxFee = excess * protocolFeeBps / 10000;
         require(amount <= maxFee, "exceeds fee cap");
-        IERC20(debtToken).safeTransfer(feeRecipient, amount);
+
+        // borrow from adapters — increases external debt, shrinks virtual buffer
+        AdapterRouter(router).borrow(amount, feeRecipient);
     }
 
     // ================================================================
@@ -343,37 +351,28 @@ contract GemachPool is Auth, ReentrancyGuard {
     /// @notice Sync state and enter emergency mode if conditions are met.
     function syncAndMaybeEnterEmergency() external onlyKeeper {
         if (emergencyMode) return;
-        uint256 buffer = bufferBalance();
-        uint256 extDebt = AdapterRouter(router).totalDebt();
-        uint256 uDebt = totalUserDebt();
-        if (buffer == 0 && sponsorBackstop == 0 && extDebt > uDebt) {
+        if (protocolBuffer() == 0 && sponsorBackstop == 0 && externalDebt() > totalUserDebt()) {
             emergencyMode = true;
         }
     }
 
-    /// @notice Force emergency mode. Governance only.
     function forceEmergencyMode() external onlyGovernance {
         emergencyMode = true;
     }
 
-    /// @notice Clear emergency mode once healthy. Governance only.
     function clearEmergencyMode() external onlyGovernance {
         require(emergencyMode, "not in emergency");
-        uint256 extDebt = AdapterRouter(router).totalDebt();
-        uint256 uDebt = totalUserDebt();
-        require(extDebt <= uDebt, "carry gap remains");
+        require(externalDebt() <= totalUserDebt(), "carry gap remains");
         emergencyMode = false;
     }
 
-    /// @notice Capitalize uncovered shortfall onto borrowers.
     function capitalizeEmergencyShortfall() external nonReentrant onlyKeeper {
         require(emergencyMode, "not emergency");
         require(totalDebtShares > 0, "no debt shares");
-        uint256 extDebt = AdapterRouter(router).totalDebt();
+        uint256 extDebt = externalDebt();
         uint256 uDebt = totalUserDebt();
         require(extDebt > uDebt, "no shortfall");
-        uint256 shortfall = extDebt - uDebt;
-        debtIndex += shortfall * 1e18 / totalDebtShares;
+        debtIndex += (extDebt - uDebt) * 1e18 / totalDebtShares;
     }
 
     // ================================================================
@@ -388,8 +387,6 @@ contract GemachPool is Auth, ReentrancyGuard {
         paused = false;
     }
 
-    // --- governance setters ---
-
     function setOracle(address _oracle) external onlyGovernance {
         require(_oracle != address(0), "zero address");
         oracle = _oracle;
@@ -398,12 +395,10 @@ contract GemachPool is Auth, ReentrancyGuard {
     function setRouter(address _router) external onlyGovernance {
         require(_router != address(0), "zero address");
         router = _router;
-        IERC20(yieldVault).forceApprove(_router, type(uint256).max);
-        IERC20(debtToken).forceApprove(_router, type(uint256).max);
+        IERC20(YIELD_VAULT).forceApprove(_router, type(uint256).max);
+        IERC20(DEBT_TOKEN).forceApprove(_router, type(uint256).max);
     }
 
-    /// @notice Set the Yearn auction address. The auction must have the pool as
-    ///         governance and the pool as receiver, with collateralToken enabled.
     function setAuction(address _auction) external onlyGovernance {
         yearnAuction = _auction;
     }
@@ -445,19 +440,16 @@ contract GemachPool is Auth, ReentrancyGuard {
         authority = _authority;
     }
 
-    /// @notice Set auction starting price in bps of oracle price (e.g. 10050 = 100.5%).
     function setAuctionStartingPriceBps(uint256 _bps) external onlyGovernance {
         require(_bps >= 10000, "below oracle");
         auctionStartingPriceBps = _bps;
     }
 
-    /// @notice Set max slippage below oracle for auction floor in bps.
     function setAuctionSlippageBps(uint256 _bps) external onlyGovernance {
         require(_bps <= 5000, "too high");
         auctionSlippageBps = _bps;
     }
 
-    /// @notice Set auction decay rate per step in bps.
     function setAuctionDecayRate(uint256 _bps) external onlyGovernance {
         require(_bps > 0 && _bps < 10000, "invalid");
         auctionDecayRate = _bps;
@@ -469,16 +461,17 @@ contract GemachPool is Auth, ReentrancyGuard {
         AdapterRouter(router).repayAdapter(adapter, amount);
     }
 
+    /// @notice Delever using any idle debt tokens sitting in the pool.
     function manualDelever(uint256 amount) external nonReentrant onlyGovernance {
-        uint256 idle = bufferBalance();
-        require(amount <= idle, "insufficient buffer");
+        uint256 idle = IERC20(DEBT_TOKEN).balanceOf(address(this));
+        require(amount <= idle, "insufficient idle");
         AdapterRouter(router).repay(amount);
     }
 
     function sweepNonCoreToken(address token, address to, uint256 amount) external onlyGovernance {
-        require(token != collateralToken, "cannot sweep collateral");
-        require(token != debtToken, "cannot sweep debt token");
-        require(token != yieldVault, "cannot sweep yield vault");
+        require(token != COLLATERAL_TOKEN, "cannot sweep collateral");
+        require(token != DEBT_TOKEN, "cannot sweep debt token");
+        require(token != YIELD_VAULT, "cannot sweep yield vault");
         IERC20(token).safeTransfer(to, amount);
     }
 
@@ -495,11 +488,11 @@ contract GemachPool is Auth, ReentrancyGuard {
     }
 
     function totalVaultShares() public view returns (uint256) {
-        return IERC20(yieldVault).balanceOf(address(this)) + AdapterRouter(router).totalCollateralShares();
+        return IERC20(YIELD_VAULT).balanceOf(address(this)) + AdapterRouter(router).totalCollateralShares();
     }
 
     function totalUnderlying() public view returns (uint256) {
-        return IYearnVault4626(yieldVault).convertToAssets(totalVaultShares());
+        return IYearnVault4626(YIELD_VAULT).convertToAssets(totalVaultShares());
     }
 
     function requiredBacking() public view returns (uint256) {
@@ -530,12 +523,45 @@ contract GemachPool is Auth, ReentrancyGuard {
     //                       INTERNAL
     // ================================================================
 
+    function _deposit(address user, uint256 amount) internal {
+        require(amount > 0, "zero amount");
+        IERC20(COLLATERAL_TOKEN).safeTransferFrom(msg.sender, address(this), amount);
+        uint256 vaultShares = IYearnVault4626(YIELD_VAULT).deposit(amount, address(this));
+        AdapterRouter(router).supplyCollateralAuto(vaultShares);
+        positions[user].principal += amount;
+        totalPrincipal += amount;
+    }
+
+    function _borrow(address user, uint256 amount, address receiver) internal {
+        require(amount > 0, "zero amount");
+        uint256 shares = amount * 1e18 / debtIndex;
+        require(shares > 0, "shares zero");
+        positions[user].debtShares += shares;
+        totalDebtShares += shares;
+        require(_userLtvBps(user) <= maxBorrowLtvBps, "ltv exceeded");
+        AdapterRouter(router).borrow(amount, receiver);
+    }
+
+    function _withdraw(address user, uint256 amount, address receiver) internal {
+        require(amount > 0, "zero amount");
+        Position storage pos = positions[user];
+        require(pos.principal >= amount, "insufficient principal");
+        pos.principal -= amount;
+        totalPrincipal -= amount;
+        if (pos.debtShares > 0) {
+            require(_userLtvBps(user) <= maxBorrowLtvBps, "ltv exceeded");
+        }
+        uint256 sharesNeeded = _ceilConvertToShares(amount);
+        AdapterRouter(router).withdrawCollateralShares(sharesNeeded, address(this));
+        IYearnVault4626(YIELD_VAULT).withdraw(amount, receiver, address(this));
+    }
+
     function _repayFor(address user, uint256 amount) internal {
         require(amount > 0, "zero amount");
         Position storage pos = positions[user];
         uint256 currentDebt = pos.debtShares * debtIndex / 1e18;
         if (amount > currentDebt) amount = currentDebt;
-        IERC20(debtToken).safeTransferFrom(msg.sender, address(this), amount);
+        IERC20(DEBT_TOKEN).safeTransferFrom(msg.sender, address(this), amount);
         AdapterRouter(router).repay(amount);
         uint256 sharesBurned = amount * 1e18 / debtIndex;
         pos.debtShares -= sharesBurned;
@@ -553,88 +579,45 @@ contract GemachPool is Auth, ReentrancyGuard {
     }
 
     function _debtToCollateral(uint256 debtValue) internal view returns (uint256) {
-        uint256 oneUnit = 10 ** _collateralDecimals();
+        uint256 oneUnit = 10 ** COLLATERAL_DECIMALS;
         uint256 pricePerUnit = IPriceOracle(oracle).quote(oneUnit);
         require(pricePerUnit > 0, "oracle: zero price");
         return debtValue * oneUnit / pricePerUnit;
     }
 
     function _ceilConvertToShares(uint256 assets) internal view returns (uint256) {
-        uint256 shares = IYearnVault4626(yieldVault).convertToShares(assets);
-        if (IYearnVault4626(yieldVault).convertToAssets(shares) < assets) {
-            shares += 1;
-        }
+        uint256 shares = IYearnVault4626(YIELD_VAULT).convertToShares(assets);
+        if (IYearnVault4626(YIELD_VAULT).convertToAssets(shares) < assets) shares += 1;
         return shares;
     }
 
-    function _collateralDecimals() internal view returns (uint8) {
-        (bool ok, bytes memory ret) = collateralToken.staticcall(abi.encodeWithSignature("decimals()"));
-        if (ok && ret.length >= 32) return abi.decode(ret, (uint8));
-        return 18;
-    }
-
-    function _debtTokenDecimals() internal view returns (uint8) {
-        (bool ok, bytes memory ret) = debtToken.staticcall(abi.encodeWithSignature("decimals()"));
-        if (ok && ret.length >= 32) return abi.decode(ret, (uint8));
-        return 18;
-    }
-
-    /// @dev Configure auction pricing and kick. Follows BaseConvertor pattern.
-    ///      Transfers collateral to auction, sets startingPrice / minimumPrice /
-    ///      stepDecayRate based on oracle, then kicks.
     function _configureAndKickAuction(uint256 redeemed) internal {
         IYearnAuction auction_ = IYearnAuction(yearnAuction);
-
-        // settle previous auction if it completed (balance 0)
-        if (auction_.isActive(collateralToken)) {
-            if (IERC20(collateralToken).balanceOf(yearnAuction) == 0) {
-                auction_.settle(collateralToken);
+        if (auction_.isActive(COLLATERAL_TOKEN)) {
+            if (IERC20(COLLATERAL_TOKEN).balanceOf(yearnAuction) == 0) {
+                auction_.settle(COLLATERAL_TOKEN);
             } else {
                 revert("auction active");
             }
         }
-
-        // set pricing
         _setAuctionPricing(redeemed);
-
-        // transfer collateral to auction and kick
-        IERC20(collateralToken).safeTransfer(yearnAuction, redeemed);
-        auction_.kick(collateralToken);
+        IERC20(COLLATERAL_TOKEN).safeTransfer(yearnAuction, redeemed);
+        auction_.kick(COLLATERAL_TOKEN);
     }
 
-    /// @dev Calculates and sets auction pricing on the Yearn Auction contract.
-    ///      Based on the BaseConvertor._auctionPricingFor pattern:
-    ///      - targetPrice = oracle price of 1 collateral unit, scaled to 1e18
-    ///      - startingPrice (lot-size) = amount * (targetPrice * startingBps / 10000) / (unit * 1e18)
-    ///      - minimumPrice = targetPrice * (10000 - slippageBps) / 10000
     function _setAuctionPricing(uint256 _amount) internal {
         IYearnAuction auction_ = IYearnAuction(yearnAuction);
-
-        uint256 colDecimals = _collateralDecimals();
-        uint256 debtDecimals = _debtTokenDecimals();
-        uint256 fromUnit = 10 ** colDecimals;
-
-        // targetPrice: oracle price of 1 collateral unit, scaled to 1e18
+        uint256 fromUnit = 10 ** COLLATERAL_DECIMALS;
         uint256 oraclePrice = IPriceOracle(oracle).quote(fromUnit);
-        uint256 targetPrice = Math.mulDiv(oraclePrice, 1e18, 10 ** debtDecimals);
+        uint256 targetPrice = Math.mulDiv(oraclePrice, 1e18, 10 ** DEBT_DECIMALS);
 
-        // startingPrice (lot-size): above market
         uint256 startUnitPrice = Math.mulDiv(targetPrice, auctionStartingPriceBps, 10000, Math.Rounding.Ceil);
         uint256 startingPrice = Math.mulDiv(_amount, startUnitPrice, fromUnit * 1e18, Math.Rounding.Ceil);
         if (startingPrice == 0) startingPrice = 1;
-
-        // minimumPrice: floor below market
         uint256 minimumPrice = Math.mulDiv(targetPrice, 10000 - auctionSlippageBps, 10000);
 
-        // apply to auction
-        if (auction_.startingPrice() != startingPrice) {
-            auction_.setStartingPrice(startingPrice);
-        }
-        if (auction_.minimumPrice() != minimumPrice) {
-            auction_.setMinimumPrice(minimumPrice);
-        }
-        if (auction_.stepDecayRate() != auctionDecayRate) {
-            auction_.setStepDecayRate(auctionDecayRate);
-        }
+        if (auction_.startingPrice() != startingPrice) auction_.setStartingPrice(startingPrice);
+        if (auction_.minimumPrice() != minimumPrice) auction_.setMinimumPrice(minimumPrice);
+        if (auction_.stepDecayRate() != auctionDecayRate) auction_.setStepDecayRate(auctionDecayRate);
     }
 }
