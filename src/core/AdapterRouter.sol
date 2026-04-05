@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {IMarketAdapter} from "../adapters/IMarketAdapter.sol";
+import {IMarketAdapter} from "../interfaces/IMarketAdapter.sol";
 import {Auth} from "../utils/Auth.sol";
 
 /// @title AdapterRouter
@@ -82,8 +82,10 @@ contract AdapterRouter is Auth {
         for (uint256 i = 0; i < _newOrder.length; i++) {
             bool found;
             for (uint256 j = 0; j < adapters.length; j++) {
-                if (_newOrder[i] == adapters[j]) found = true;
-                break;
+                if (_newOrder[i] == adapters[j]) {
+                    found = true;
+                    break;
+                }
             }
             require(found, "unknown adapter");
         }
@@ -134,9 +136,6 @@ contract AdapterRouter is Auth {
             uint256 paid = IMarketAdapter(a).repay(chunk);
             repaid += paid;
             remaining -= paid;
-        }
-        if (remaining > 0) {
-            IERC20(DEBT_TOKEN).safeTransfer(msg.sender, remaining);
         }
     }
 

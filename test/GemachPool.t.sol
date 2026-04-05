@@ -67,8 +67,8 @@ contract GemachPoolTest is Test {
         router.setPool(address(pool));
 
         // deploy adapters (A=low rate 2%, B=high rate 8%)
-        adapterA = new MockAdapter(address(yvBTC), address(usdc), 0.02e18);
-        adapterB = new MockAdapter(address(yvBTC), address(usdc), 0.08e18);
+        adapterA = new MockAdapter(address(yvBTC), address(usdc));
+        adapterB = new MockAdapter(address(yvBTC), address(usdc));
         adapterA.setRouter(address(router));
         adapterB.setRouter(address(router));
 
@@ -234,7 +234,7 @@ contract GemachPoolTest is Test {
         vm.prank(alice);
         pool.borrow(44_000e6, alice);
 
-        oracle.setPrice(50_000e6);
+        oracle.setBtcPrice(50_000e6);
 
         uint256 sponsorBefore = pool.sponsorBackstop();
         (uint256 principalBefore,) = pool.positions(alice);
@@ -343,7 +343,7 @@ contract GemachPoolTest is Test {
         vm.stopPrank();
 
         // allowed: liquidate
-        oracle.setPrice(50_000e6);
+        oracle.setBtcPrice(50_000e6);
         vm.prank(liquidator);
         pool.liquidate(alice, 1_000e6, true, liquidator);
 
@@ -544,7 +544,7 @@ contract GemachPoolTest is Test {
         vm.prank(alice);
         pool.borrow(44_000e6, alice);
 
-        oracle.setPrice(50_000e6);
+        oracle.setBtcPrice(50_000e6);
 
         uint256 yvBalBefore = yvBTC.balanceOf(liquidator);
         vm.prank(liquidator);
@@ -561,7 +561,7 @@ contract GemachPoolTest is Test {
         vm.prank(alice);
         pool.borrow(44_000e6, alice);
 
-        oracle.setPrice(50_000e6);
+        oracle.setBtcPrice(50_000e6);
 
         // try to repay way more than user's debt
         vm.prank(liquidator);
@@ -924,7 +924,7 @@ contract GemachPoolTest is Test {
     // --- router adapter management ---
 
     function test_routerAdapterManagement() public {
-        MockAdapter newAdapter = new MockAdapter(address(yvBTC), address(usdc), 0.05e18);
+        MockAdapter newAdapter = new MockAdapter(address(yvBTC), address(usdc));
         newAdapter.setRouter(address(router));
         router.addAdapter(address(newAdapter));
         assertEq(router.adapterCount(), 3);
@@ -937,13 +937,13 @@ contract GemachPoolTest is Test {
     }
 
     function test_router_addAdapter_wrongCollateral() public {
-        MockAdapter bad = new MockAdapter(address(usdc), address(usdc), 0);
+        MockAdapter bad = new MockAdapter(address(usdc), address(usdc));
         vm.expectRevert("wrong collateral");
         router.addAdapter(address(bad));
     }
 
     function test_router_addAdapter_wrongLoan() public {
-        MockAdapter bad = new MockAdapter(address(yvBTC), address(cbBTC), 0);
+        MockAdapter bad = new MockAdapter(address(yvBTC), address(cbBTC));
         vm.expectRevert("wrong loan");
         router.addAdapter(address(bad));
     }
@@ -954,7 +954,7 @@ contract GemachPoolTest is Test {
     }
 
     function test_router_disableAdapter_notEnabled() public {
-        MockAdapter newA = new MockAdapter(address(yvBTC), address(usdc), 0);
+        MockAdapter newA = new MockAdapter(address(yvBTC), address(usdc));
         vm.expectRevert("not enabled");
         router.disableAdapter(address(newA));
     }
@@ -980,13 +980,13 @@ contract GemachPoolTest is Test {
     function test_router_maxAdapters() public {
         // already have 2, fill up to 8
         for (uint256 i = 2; i < 8; i++) {
-            MockAdapter a = new MockAdapter(address(yvBTC), address(usdc), 0);
+            MockAdapter a = new MockAdapter(address(yvBTC), address(usdc));
             a.setRouter(address(router));
             router.addAdapter(address(a));
         }
         assertEq(router.adapterCount(), 8);
 
-        MockAdapter overflow = new MockAdapter(address(yvBTC), address(usdc), 0);
+        MockAdapter overflow = new MockAdapter(address(yvBTC), address(usdc));
         vm.expectRevert("max adapters");
         router.addAdapter(address(overflow));
     }
@@ -1473,7 +1473,7 @@ contract GemachPoolTest is Test {
         vm.prank(alice);
         pool.borrow(44_000e6, alice);
 
-        oracle.setPrice(50_000e6);
+        oracle.setBtcPrice(50_000e6);
         repayAmt = bound(repayAmt, 1e6, 44_000e6);
 
         usdc.mint(liquidator, repayAmt);
@@ -1517,7 +1517,7 @@ contract GemachPoolTest is Test {
         pool.borrow(44_000e6, alice);
 
         // crash price so seizure value exceeds principal
-        oracle.setPrice(30_000e6); // 1 BTC = 30k -> LTV ~147%
+        oracle.setBtcPrice(30_000e6); // 1 BTC = 30k -> LTV ~147%
 
         // repay full 44k -> seizedValue = 44000 * 1.05 = 46200 USDC
         // 46200 / 30000 = 1.54 BTC > 1 BTC principal -> should cap
@@ -1567,7 +1567,7 @@ contract GemachPoolTest is Test {
         // Currently only supplyCollateralAuto is used, but let's test the function exists
         // by calling it through the pool mechanism (pool uses supplyCollateralAuto)
         // We'll test the adapter-not-enabled revert via the non-auto path
-        MockAdapter disabledAdapter = new MockAdapter(address(yvBTC), address(usdc), 0);
+        MockAdapter disabledAdapter = new MockAdapter(address(yvBTC), address(usdc));
         disabledAdapter.setRouter(address(router));
         router.addAdapter(address(disabledAdapter));
         router.disableAdapter(address(disabledAdapter));
@@ -1649,10 +1649,10 @@ contract GemachPoolTest is Test {
         vm.prank(alice);
         pool.deposit(1e8);
 
-        oracle.setPrice(0);
+        oracle.setBtcPrice(0);
 
         vm.prank(alice);
-        vm.expectRevert("oracle: zero value");
+        vm.expectRevert("oracle: zero price");
         pool.borrow(1e6, alice);
     }
 
@@ -1662,10 +1662,10 @@ contract GemachPoolTest is Test {
         vm.prank(alice);
         pool.borrow(44_000e6, alice);
 
-        oracle.setPrice(0);
+        oracle.setBtcPrice(0);
 
         vm.prank(liquidator);
-        vm.expectRevert("oracle: zero value");
+        vm.expectRevert("oracle: zero price");
         pool.liquidate(alice, 1_000e6, true, liquidator);
     }
 
@@ -1852,7 +1852,7 @@ contract GemachPoolTest is Test {
 
         assertFalse(viewer.isLiquidatable(address(pool), alice));
 
-        oracle.setPrice(50_000e6);
+        oracle.setBtcPrice(50_000e6);
         // LTV = 44000/50000 = 88% > 85%
         assertTrue(viewer.isLiquidatable(address(pool), alice));
     }
@@ -1926,7 +1926,7 @@ contract GemachPoolTest is Test {
         vm.prank(bob);
         pool.borrow(20_000e6, bob);
 
-        oracle.setPrice(50_000e6);
+        oracle.setBtcPrice(50_000e6);
 
         address[] memory users = new address[](2);
         users[0] = alice;

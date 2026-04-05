@@ -7,6 +7,8 @@ import {IPriceOracle} from "../interfaces/IPriceOracle.sol";
 /// @title Positions
 /// @notice Library for querying user positions and global pool state.
 library Positions {
+    uint256 internal constant ORACLE_PRICE_SCALE = 1e36;
+
     struct UserPositionData {
         uint256 principal;
         uint256 debtShares;
@@ -128,7 +130,7 @@ library Positions {
     function utilizationBps(GemachPool p) internal view returns (uint256) {
         uint256 totalDebtVal = p.totalUserDebt();
         if (totalDebtVal == 0) return 0;
-        uint256 totalColVal = IPriceOracle(p.oracle()).quote(p.totalPrincipal());
+        uint256 totalColVal = p.totalPrincipal() * IPriceOracle(p.oracle()).price() / ORACLE_PRICE_SCALE;
         if (totalColVal == 0) return type(uint256).max;
         return totalDebtVal * 10000 / totalColVal;
     }
@@ -163,7 +165,7 @@ library Positions {
 
     function _availableToBorrow(GemachPool p, uint256 principal, uint256 debtShares) private view returns (uint256) {
         if (principal == 0) return 0;
-        uint256 colValue = IPriceOracle(p.oracle()).quote(principal);
+        uint256 colValue = principal * IPriceOracle(p.oracle()).price() / ORACLE_PRICE_SCALE;
         uint256 maxDebt = colValue * p.maxBorrowLtvBps() / 10000;
         uint256 currentDebt = debtShares * p.debtIndex() / 1e18;
         return maxDebt > currentDebt ? maxDebt - currentDebt : 0;
@@ -176,12 +178,12 @@ library Positions {
         if (maxLtv == 0) return 0;
 
         uint256 minColValue = currentDebt * 10000 / maxLtv;
-        uint256 currentColValue = IPriceOracle(p.oracle()).quote(principal);
+        uint256 currentColValue = principal * IPriceOracle(p.oracle()).price() / ORACLE_PRICE_SCALE;
         if (currentColValue <= minColValue) return 0;
 
         uint256 excessValue = currentColValue - minColValue;
         uint256 oneUnit = 10 ** p.COLLATERAL_DECIMALS();
-        uint256 pricePerUnit = IPriceOracle(p.oracle()).quote(oneUnit);
+        uint256 pricePerUnit = oneUnit * IPriceOracle(p.oracle()).price() / ORACLE_PRICE_SCALE;
         if (pricePerUnit == 0) return 0;
 
         uint256 withdrawable = excessValue * oneUnit / pricePerUnit;

@@ -2,10 +2,10 @@
 pragma solidity ^0.8.24;
 
 /// @title IPriceOracle
-/// @notice Minimal oracle interface to quote collateral value in debt-token units.
+/// @notice Morpho-style price oracle. Returns the value of collateral in
+///         debt-token units, scaled by 1e36.
+///         Semantics: debtAmount = collateralAmount * price() / 1e36
 interface IPriceOracle {
-    /// @notice Returns the debt-token value of the given collateral amount.
-    /// @param collateralAmount Amount of collateral token.
-    /// @return debtValue Equivalent value in debt-token units.
-    function quote(uint256 collateralAmount) external view returns (uint256 debtValue);
+    /// @notice Returns the price of collateral in debt token, scaled to 1e36.
+    function price() external view returns (uint256);
 }

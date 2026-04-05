@@ -21,6 +21,8 @@ import {Auth} from "../utils/Auth.sol";
 contract GemachPool is Auth, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
+    uint256 internal constant ORACLE_PRICE_SCALE = 1e36;
+
     // -------- position --------
 
     struct Position {
@@ -516,7 +518,7 @@ contract GemachPool is Auth, ReentrancyGuard {
     }
 
     function userCollateralValue(address user) public view returns (uint256) {
-        return IPriceOracle(oracle).quote(positions[user].principal);
+        return positions[user].principal * IPriceOracle(oracle).price() / ORACLE_PRICE_SCALE;
     }
 
     // ================================================================
@@ -573,16 +575,16 @@ contract GemachPool is Auth, ReentrancyGuard {
         if (pos.principal == 0) return type(uint256).max;
         uint256 debt = pos.debtShares * debtIndex / 1e18;
         if (debt == 0) return 0;
-        uint256 colValue = IPriceOracle(oracle).quote(pos.principal);
-        require(colValue > 0, "oracle: zero value");
+        uint256 oraclePrice = IPriceOracle(oracle).price();
+        require(oraclePrice > 0, "oracle: zero price");
+        uint256 colValue = pos.principal * oraclePrice / ORACLE_PRICE_SCALE;
         return debt * 10000 / colValue;
     }
 
     function _debtToCollateral(uint256 debtValue) internal view returns (uint256) {
-        uint256 oneUnit = 10 ** COLLATERAL_DECIMALS;
-        uint256 pricePerUnit = IPriceOracle(oracle).quote(oneUnit);
-        require(pricePerUnit > 0, "oracle: zero price");
-        return debtValue * oneUnit / pricePerUnit;
+        uint256 oraclePrice = IPriceOracle(oracle).price();
+        require(oraclePrice > 0, "oracle: zero price");
+        return debtValue * ORACLE_PRICE_SCALE / oraclePrice;
     }
 
     function _ceilConvertToShares(uint256 assets) internal view returns (uint256) {
@@ -608,8 +610,12 @@ contract GemachPool is Auth, ReentrancyGuard {
     function _setAuctionPricing(uint256 _amount) internal {
         IYearnAuction auction_ = IYearnAuction(yearnAuction);
         uint256 fromUnit = 10 ** COLLATERAL_DECIMALS;
-        uint256 oraclePrice = IPriceOracle(oracle).quote(fromUnit);
-        uint256 targetPrice = Math.mulDiv(oraclePrice, 1e18, 10 ** DEBT_DECIMALS);
+        // targetPrice = price of 1 collateral unit in want, scaled to 1e18
+        // oracle: debtAmount = collateralAmount * price / 1e36
+        // so for 1 unit: debtAmount = fromUnit * price / 1e36
+        // scale to 1e18: targetPrice = fromUnit * price / 1e36 * 1e18 / (10 ** DEBT_DECIMALS)
+        uint256 oraclePrice = IPriceOracle(oracle).price();
+        uint256 targetPrice = Math.mulDiv(fromUnit * oraclePrice, 1e18, ORACLE_PRICE_SCALE * (10 ** DEBT_DECIMALS));
 
         uint256 startUnitPrice = Math.mulDiv(targetPrice, auctionStartingPriceBps, 10000, Math.Rounding.Ceil);
         uint256 startingPrice = Math.mulDiv(_amount, startUnitPrice, fromUnit * 1e18, Math.Rounding.Ceil);
