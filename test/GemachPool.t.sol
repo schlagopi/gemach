@@ -1793,14 +1793,14 @@ contract GemachPoolTest is Test {
     // ================================================================
 
     function test_viewer_getUserPosition() public {
-        PositionViewer viewer = new PositionViewer();
+        PositionsHarness viewer = new PositionsHarness();
 
         vm.prank(alice);
         pool.deposit(1e8);
         vm.prank(alice);
         pool.borrow(30_000e6, alice);
 
-        PositionViewer.UserPositionData memory data = viewer.getUserPosition(address(pool), alice);
+        Positions.UserPositionData memory data = viewer.getUserPosition(address(pool), alice);
 
         assertEq(data.principal, 1e8);
         assertEq(data.currentDebt, 30_000e6);
@@ -1815,7 +1815,7 @@ contract GemachPoolTest is Test {
     }
 
     function test_viewer_isLiquidatable() public {
-        PositionViewer viewer = new PositionViewer();
+        PositionsHarness viewer = new PositionsHarness();
 
         vm.prank(alice);
         pool.deposit(1e8);
@@ -1830,7 +1830,7 @@ contract GemachPoolTest is Test {
     }
 
     function test_viewer_currentLtv() public {
-        PositionViewer viewer = new PositionViewer();
+        PositionsHarness viewer = new PositionsHarness();
 
         vm.prank(alice);
         pool.deposit(1e8);
@@ -1844,7 +1844,7 @@ contract GemachPoolTest is Test {
     }
 
     function test_viewer_totalDebt() public {
-        PositionViewer viewer = new PositionViewer();
+        PositionsHarness viewer = new PositionsHarness();
 
         vm.prank(alice);
         pool.deposit(1e8);
@@ -1855,14 +1855,14 @@ contract GemachPoolTest is Test {
     }
 
     function test_viewer_getGlobalState() public {
-        PositionViewer viewer = new PositionViewer();
+        PositionsHarness viewer = new PositionsHarness();
 
         vm.prank(alice);
         pool.deposit(1e8);
         vm.prank(alice);
         pool.borrow(20_000e6, alice);
 
-        PositionViewer.GlobalStateData memory state = viewer.getGlobalState(address(pool));
+        Positions.GlobalStateData memory state = viewer.getGlobalState(address(pool));
 
         assertEq(state.totalPrincipal, 1e8);
         assertEq(state.totalUserDebt, 20_000e6);
@@ -1874,7 +1874,7 @@ contract GemachPoolTest is Test {
     }
 
     function test_viewer_utilizationBps() public {
-        PositionViewer viewer = new PositionViewer();
+        PositionsHarness viewer = new PositionsHarness();
 
         vm.prank(alice);
         pool.deposit(1e8);
@@ -1886,7 +1886,7 @@ contract GemachPoolTest is Test {
     }
 
     function test_viewer_batchIsLiquidatable() public {
-        PositionViewer viewer = new PositionViewer();
+        PositionsHarness viewer = new PositionsHarness();
 
         vm.prank(alice);
         pool.deposit(1e8);
@@ -1910,12 +1910,12 @@ contract GemachPoolTest is Test {
     }
 
     function test_viewer_availableToBorrow_noPosition() public {
-        PositionViewer viewer = new PositionViewer();
+        PositionsHarness viewer = new PositionsHarness();
         assertEq(viewer.availableToBorrow(address(pool), nobody), 0);
     }
 
     function test_viewer_availableToWithdraw_noDebt() public {
-        PositionViewer viewer = new PositionViewer();
+        PositionsHarness viewer = new PositionsHarness();
 
         vm.prank(alice);
         pool.deposit(1e8);
@@ -1924,7 +1924,7 @@ contract GemachPoolTest is Test {
     }
 
     function test_viewer_collateralValue() public {
-        PositionViewer viewer = new PositionViewer();
+        PositionsHarness viewer = new PositionsHarness();
 
         vm.prank(alice);
         pool.deposit(1e8);
@@ -1965,4 +1965,49 @@ contract GemachPoolTest is Test {
     }
 }
 
-import {PositionViewer} from "../src/core/PositionViewer.sol";
+import {Positions} from "../src/libraries/Positions.sol";
+
+/// @dev Thin wrapper so tests can call the Positions library.
+contract PositionsHarness {
+    using Positions for GemachPool;
+
+    function getUserPosition(address pool, address user) external view returns (Positions.UserPositionData memory) {
+        return GemachPool(pool).getUserPosition(user);
+    }
+
+    function currentLtv(address pool, address user) external view returns (uint256) {
+        return GemachPool(pool).currentLtv(user);
+    }
+
+    function totalDebt(address pool, address user) external view returns (uint256) {
+        return GemachPool(pool).totalDebt(user);
+    }
+
+    function isLiquidatable(address pool, address user) external view returns (bool) {
+        return GemachPool(pool).isLiquidatable(user);
+    }
+
+    function availableToBorrow(address pool, address user) external view returns (uint256) {
+        return GemachPool(pool).availableToBorrow(user);
+    }
+
+    function availableToWithdraw(address pool, address user) external view returns (uint256) {
+        return GemachPool(pool).availableToWithdraw(user);
+    }
+
+    function collateralValue(address pool, address user) external view returns (uint256) {
+        return GemachPool(pool).collateralValue(user);
+    }
+
+    function getGlobalState(address pool) external view returns (Positions.GlobalStateData memory) {
+        return GemachPool(pool).getGlobalState();
+    }
+
+    function utilizationBps(address pool) external view returns (uint256) {
+        return GemachPool(pool).utilizationBps();
+    }
+
+    function batchIsLiquidatable(address pool, address[] calldata users) external view returns (bool[] memory) {
+        return GemachPool(pool).batchIsLiquidatable(users);
+    }
+}
