@@ -794,7 +794,7 @@ contract GemachPoolTest is Test {
         pool.forceEmergencyMode();
         // no accrued interest = no shortfall
         vm.prank(keeper);
-        vm.expectRevert("no shortfall");
+        vm.expectRevert("no new shortfall");
         pool.capitalizeEmergencyShortfall();
     }
 
@@ -2106,6 +2106,85 @@ contract GemachPoolTest is Test {
         bad[1] = address(0x999);
         vm.expectRevert("unknown adapter");
         router.reorderAdapters(bad);
+    }
+
+    // --- H-4 fix: reorder rejects duplicates ---
+
+    function test_reorderAdapters_rejectsDuplicates() public {
+        address[] memory dup = new address[](2);
+        dup[0] = address(adapterA);
+        dup[1] = address(adapterA);
+        vm.expectRevert("duplicate adapter");
+        router.reorderAdapters(dup);
+    }
+
+    // --- H-1 fix: full repay clears all debt shares (no dust) ---
+
+    function test_h1_fullRepayNoDust() public {
+        vm.prank(alice);
+        pool.deposit(1e8);
+        vm.prank(alice);
+        pool.borrow(30_000e6, alice);
+
+        // simulate emergency capitalization to create a non-round debtIndex
+        adapterA.accrueInterest(1_234e6);
+        pool.forceEmergencyMode();
+        vm.prank(keeper);
+        pool.capitalizeEmergencyShortfall();
+
+        // debtIndex is now non-round
+        uint256 idx = pool.debtIndex();
+        assertGt(idx, 1e18);
+
+        // full repay should leave zero shares (even in emergency, repay works)
+        uint256 debt = pool.userDebt(alice);
+        usdc.mint(alice, debt);
+        vm.startPrank(alice);
+        usdc.approve(address(pool), type(uint256).max);
+        pool.repay(debt);
+        vm.stopPrank();
+
+        (, uint256 shares) = pool.positions(alice);
+        assertEq(shares, 0, "no dust shares after full repay");
+        assertEq(pool.userDebt(alice), 0, "debt is exactly zero");
+    }
+
+    // --- H-2 fix: capitalize only net-new shortfall ---
+
+    function test_h2_capitalizeOnlyNetNew() public {
+        vm.prank(alice);
+        pool.deposit(1e8);
+        vm.prank(alice);
+        pool.borrow(20_000e6, alice);
+
+        adapterA.accrueInterest(5_000e6);
+        pool.forceEmergencyMode();
+
+        // first capitalization
+        vm.prank(keeper);
+        pool.capitalizeEmergencyShortfall();
+        uint256 indexAfterFirst = pool.debtIndex();
+
+        // calling again immediately should revert (no NEW shortfall)
+        vm.prank(keeper);
+        vm.expectRevert("no new shortfall");
+        pool.capitalizeEmergencyShortfall();
+
+        // debtIndex unchanged
+        assertEq(pool.debtIndex(), indexAfterFirst);
+
+        // simulate more interest accrual
+        adapterA.accrueInterest(1_000e6);
+
+        // now can capitalize the new 1k gap only
+        uint256 debtBefore = pool.totalUserDebt();
+        vm.prank(keeper);
+        pool.capitalizeEmergencyShortfall();
+        uint256 debtAfter = pool.totalUserDebt();
+
+        // debt should have increased by ~1000 (the new shortfall), not 6000
+        uint256 increase = debtAfter - debtBefore;
+        assertApproxEqAbs(increase, 1_000e6, 1, "only net-new shortfall capitalized");
     }
 
     // ================================================================

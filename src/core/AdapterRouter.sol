@@ -78,8 +78,13 @@ contract AdapterRouter is Auth {
     ///         must appear exactly once.
     function reorderAdapters(address[] calldata _newOrder) external onlyGovernance {
         require(_newOrder.length == adapters.length, "length mismatch");
-        // verify same set
+        // verify same set with no duplicates (H-4 fix)
         for (uint256 i = 0; i < _newOrder.length; i++) {
+            // check for duplicates
+            for (uint256 k = i + 1; k < _newOrder.length; k++) {
+                require(_newOrder[i] != _newOrder[k], "duplicate adapter");
+            }
+            // check exists in current set
             bool found;
             for (uint256 j = 0; j < adapters.length; j++) {
                 if (_newOrder[i] == adapters[j]) {

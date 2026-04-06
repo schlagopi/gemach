@@ -62,6 +62,8 @@ contract GemachPool is Auth, ReentrancyGuard {
     uint256 public liquidationLtvBps;
     uint256 public liquidationBonusBps;
 
+    uint256 public lastCapitalizedExtDebt;
+
     uint256 public feeActivationBufferBps;
     uint256 public protocolFeeBps;
     uint256 public minAuctionLot;
@@ -200,12 +202,14 @@ contract GemachPool is Auth, ReentrancyGuard {
 
         Position storage pos = positions[user];
         uint256 currentDebt = pos.debtShares * debtIndex / 1e18;
-        if (repayAmount > currentDebt) repayAmount = currentDebt;
+        bool fullRepay = repayAmount >= currentDebt;
+        if (fullRepay) repayAmount = currentDebt;
 
         IERC20(DEBT_TOKEN).safeTransferFrom(msg.sender, address(this), repayAmount);
         AdapterRouter(router).repay(repayAmount);
 
-        uint256 sharesBurned = repayAmount * 1e18 / debtIndex;
+        // H-1 fix: on full repay, burn all shares to avoid dust from rounding
+        uint256 sharesBurned = fullRepay ? pos.debtShares : repayAmount * 1e18 / debtIndex;
         pos.debtShares -= sharesBurned;
         totalDebtShares -= sharesBurned;
 
@@ -366,15 +370,21 @@ contract GemachPool is Auth, ReentrancyGuard {
         require(emergencyMode, "not in emergency");
         require(externalDebt() <= totalUserDebt(), "carry gap remains");
         emergencyMode = false;
+        lastCapitalizedExtDebt = 0;
     }
 
+    /// @notice Capitalize uncovered shortfall onto borrowers. Only capitalizes
+    ///         the net-new gap since the last call (H-2 fix: prevents re-capitalizing
+    ///         already-socialized interest).
     function capitalizeEmergencyShortfall() external nonReentrant onlyKeeper {
         require(emergencyMode, "not emergency");
         require(totalDebtShares > 0, "no debt shares");
         uint256 extDebt = externalDebt();
-        uint256 uDebt = totalUserDebt();
-        require(extDebt > uDebt, "no shortfall");
-        debtIndex += (extDebt - uDebt) * 1e18 / totalDebtShares;
+        uint256 baseline = lastCapitalizedExtDebt > totalUserDebt() ? lastCapitalizedExtDebt : totalUserDebt();
+        require(extDebt > baseline, "no new shortfall");
+        uint256 shortfall = extDebt - baseline;
+        debtIndex += shortfall * 1e18 / totalDebtShares;
+        lastCapitalizedExtDebt = extDebt;
     }
 
     // ================================================================
@@ -562,10 +572,12 @@ contract GemachPool is Auth, ReentrancyGuard {
         require(amount > 0, "zero amount");
         Position storage pos = positions[user];
         uint256 currentDebt = pos.debtShares * debtIndex / 1e18;
-        if (amount > currentDebt) amount = currentDebt;
+        bool fullRepay = amount >= currentDebt;
+        if (fullRepay) amount = currentDebt;
         IERC20(DEBT_TOKEN).safeTransferFrom(msg.sender, address(this), amount);
         AdapterRouter(router).repay(amount);
-        uint256 sharesBurned = amount * 1e18 / debtIndex;
+        // H-1 fix: on full repay, burn all shares to avoid dust from rounding
+        uint256 sharesBurned = fullRepay ? pos.debtShares : amount * 1e18 / debtIndex;
         pos.debtShares -= sharesBurned;
         totalDebtShares -= sharesBurned;
     }
